@@ -48,17 +48,46 @@ politecrawl/
 **Цель:** асинхронно скачать страницу и достать из неё ссылки.
 
 **Модуль:** `fetcher.py`
-- `async fetch(client: httpx.AsyncClient, url: str) -> FetchResult` — GET,
-  возвращает статус + тело (+ content-type). Ошибки сети/таймауты — не
-  роняют обход, а возвращаются как результат-с-ошибкой.
-- `extract_links(base_url: str, html: str) -> list[str]` — парсинг `<a href>`
-  через stdlib `html.parser`, абсолютизация через `urljoin`, фильтр по схемам
-  (только `http`/`https`).
+
+Тип результата (dataclass, поле `error` отличает успех от ошибки — обход не
+роняется):
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class FetchResult:
+    url: str                 # запрошенный URL (до редиректов)
+    status: int | None       # HTTP-статус; None если запрос не дошёл (сеть/таймаут)
+    body: str                # тело ответа (пустая строка при ошибке)
+    content_type: str | None # значение заголовка Content-Type (или None)
+    error: str | None        # текст ошибки (repr исключения) или None при успехе
+```
+
+Функции:
+
+- `async def fetch(client: httpx.AsyncClient, url: str) -> FetchResult` — GET по
+  `url`. Любое `httpx.HTTPError` (включая `httpx.TimeoutException`) перехватывается
+  и возвращается как `FetchResult(url=url, status=None, body="", content_type=None,
+  error=repr(exc))`. HTTP-статусы 4xx/5xx — это **не** ошибка обхода: возвращаются
+  как обычный `FetchResult` со своим `status` и пустым `error` (`raise_for_status`
+  НЕ вызывается). Редиректы следуются httpx-клиентом (`follow_redirects=True` задаёт
+  вызывающий код при создании клиента).
+- `def extract_links(base_url: str, html: str) -> list[str]` — парсинг `<a href>`
+  через подкласс stdlib `html.parser.HTMLParser` (собирать значения атрибута `href`
+  тегов `a`). Каждое значение абсолютизируется через `urllib.parse.urljoin(base_url,
+  href)`. Оставляем только результаты со схемой `http`/`https` (проверка через
+  `urlsplit(...).scheme`); тем самым отбрасываются `mailto:`, `javascript:`,
+  `tel:`, чистые якоря (`#frag` → тот же base, схема http/https — остаётся как есть,
+  дедуп на Этапе 4 схлопнёт фрагмент). Порядок сохраняется, дубли на этом этапе
+  НЕ убираются (это ответственность `dedup`). Возвращает `list[str]` абсолютных URL.
 - Простейший цикл-обход поверх `asyncio.gather` по фронтиру (ещё БЕЗ
   rate-limit/robots/dedup — они добавятся этапами 2–4).
 
-**Тесты (respx):** мок 200/404/redirect; extract_links на фикстур-HTML
-(относительные/абсолютные/якорные/`mailto:`-ссылки), таймаут → результат-ошибка.
+**Тесты (respx):** мок 200/404/redirect; `extract_links` на фикстур-HTML со
+всеми видами ссылок — относительные (`/next`, `sub/page`), абсолютные
+(`https://other/x`), якорные (`#section`), `mailto:`/`javascript:` (должны
+отсеяться); таймаут → `FetchResult` с `status=None` и заполненным `error`.
 
 **Готово когда:** можно скачать seed и получить список исходящих абсолютных ссылок.
 
@@ -70,15 +99,29 @@ politecrawl/
 `robots.txt` каждого домена грузится **один раз** и кешируется.
 
 **Модуль:** `robots.py`
-- `RobotsCache` — реестр `dict[str, RobotFileParser]` по хосту.
-- `async allowed(client, url, user_agent) -> bool`:
-  - вычислить хост; если правил ещё нет — лениво скачать `scheme://host/robots.txt`
-    через httpx и распарсить `RobotFileParser`;
-  - отсутствие/ошибка `robots.txt` (404/сеть) → «разрешено всё» (стандартное поведение);
+- `RobotsCache(client: httpx.AsyncClient)` — держит httpx-клиент и реестр
+  `self._parsers: dict[str, urllib.robotparser.RobotFileParser]` по ключу
+  `scheme://host` (схема входит в ключ: http и https — разные robots).
+  Плюс `self._registry_lock = asyncio.Lock()` (см. ниже).
+- `async def allowed(self, url: str, user_agent: str) -> bool`:
+  - ключ хоста = `f"{scheme}://{netloc}"` из `urllib.parse.urlsplit(url)` (`netloc`
+    включает порт, если он есть);
+  - если для ключа ещё нет `RobotFileParser` — лениво скачать `{key}/robots.txt`
+    через `self._client.get(...)` и скормить текст в `rfp.parse(text.splitlines())`;
+  - отсутствие/ошибка `robots.txt` — HTTP 4xx/5xx **или** `httpx.HTTPError` (сеть/
+    таймаут) → трактуем как «разрешено всё»: кладём в кеш `RobotFileParser`, для
+    которого `can_fetch` всегда `True` (напр. распарсенный из пустой строки).
+    Ошибка загрузки robots НЕ роняет обход;
   - вернуть `rfp.can_fetch(user_agent, url)`.
 - Конкурентная защита: параллельные воркеры не должны грузить один и тот же
-  `robots.txt` дважды. Применяем **тот же паттерн per-key lock**, что и в Этапе 3
-  (см. SKILL.md): `asyncio.Lock` на создание записи кеша по хосту.
+  `robots.txt` дважды. Применяем **тот же паттерн per-key lock (double-checked
+  locking)**, что и в Этапе 3 (см. SKILL.md): под `self._registry_lock` проверяем-
+  и-создаём запись кеша по ключу хоста; сам сетевой запрос robots.txt при этом
+  выполняется под lock намеренно (запись создаётся ровно один раз) — на разных
+  хостах записи независимы, но параллельная загрузка robots РАЗНЫХ хостов
+  сериализуется этим единым lock. Для учебного скоупа это приемлемо; если понадобится
+  параллельная загрузка robots разных хостов — перейти на per-key `asyncio.Lock`
+  (реестр lock'ов), но это усложнение вне MVP.
 
 **Тесты (respx):** мок `robots.txt` с `Disallow`; проверка что запрещённый путь
 даёт `False`, разрешённый `True`; 404 robots → всё разрешено; **robots.txt
@@ -100,9 +143,14 @@ politecrawl/
   - реестр `self._sems: dict[str, asyncio.Semaphore]`;
   - один общий `self._registry_lock = asyncio.Lock()` **только** для защиты
     ленивого создания семафора (не удерживается на время самого запроса!);
-  - `async def slot(domain) -> AsyncContextManager` — под `_registry_lock`
-    достаёт-или-создаёт `Semaphore(per_domain)` для домена, затем **вне** этого
-    lock делает `async with sem:` (это и есть точка backpressure к домену).
+  - `slot(self, domain: str)` — `@asynccontextmanager`, аннотация возврата
+    `AsyncIterator[None]` (используется как `async with limiter.slot(domain):`).
+    Внутри: достаёт-или-создаёт `Semaphore(per_domain)` под `_registry_lock`
+    (double-checked locking), затем **вне** lock делает `async with sem: yield`
+    (это и есть точка backpressure к домену). Готовую реализацию см. в
+    `.claude/skills/py-crawler-dev/SKILL.md` — этот этап реализуется точно по ней.
+    «Домен» здесь — ключ лимита; вызывающий (Этап 5) передаёт хост из URL
+    (`urlsplit(url).netloc`).
 
 **Критический инвариант (что тестируем усиленно):**
 1. Слоты разных доменов **не блокируют друг друга** — при `per_domain=1` две
@@ -162,21 +210,55 @@ filter вынесен в POST_MVP (для сценария распределё�
 **Цель:** собрать всё вместе за CLI, ограничить глубину, напечатать отчёт.
 
 **Модуль:** `cli.py` (+ сборка `Crawler`)
-- `argparse`: один или несколько seed-URL (позиционные), `--max-depth` (int),
-  `--per-domain-concurrency` (int, дефолт 2), `--user-agent` (str),
-  `--total-workers` (int).
-- Фронтир хранит `(url, depth)`; ссылки со страницы глубины `d` кладутся с
-  `d+1`, только если `d+1 <= max_depth`.
-- Сборка воркер-пула: N `asyncio.Task`, тянущих из `asyncio.Queue`, каждая
-  проходит конвейер dedup → robots → ratelimit.slot → fetch → extract → enqueue.
-- Корректное завершение: пустой фронтир + все воркеры idle → стоп (напр. через
-  счётчик in-flight задач или `queue.join()`).
-- Итоговый отчёт: сколько посещено, пропущено (dedup/robots), ошибок; разбивка
-  по доменам; общее время.
+
+**Аргументы (`argparse`):**
+
+| Аргумент | Тип | Дефолт | Смысл |
+|---|---|---|---|
+| `seeds` | позиционные, `nargs="+"` | — | один или несколько seed-URL |
+| `--max-depth` | `int` | `2` | глубина от seed; seed = глубина 0 |
+| `--per-domain-concurrency` | `int` | `2` | лимит одновременных запросов к одному хосту |
+| `--total-workers` | `int` | `8` | размер пула воркеров |
+| `--user-agent` | `str` | `"politecrawl/0.0"` | UA для запросов и `robots.can_fetch` |
+
+`main(argv)` парсит аргументы и вызывает `asyncio.run(crawl(...))`; возвращает `0`.
+
+**Фронтир и элемент работы:** `asyncio.Queue[tuple[str, int]]` из пар
+`(url, depth)`. Seed-URL кладутся с `depth=0`. Ссылки, извлечённые со страницы
+глубины `d`, кладутся с `d+1`, только если `d + 1 <= max_depth`.
+
+**Конвейер на один элемент `(url, depth)`** (порядок фиксирован):
+1. `dedup.add(url)` → если `False` (уже видели) — учесть `skipped_dedup`, `continue`.
+   (Проверка/вставка в один шаг, чтобы два воркера не обошли один URL — `add`
+   атомарен в рамках одного event-loop-шага.)
+2. `await robots.allowed(url, user_agent)` → если `False` — учесть `skipped_robots`,
+   `continue`.
+3. `async with limiter.slot(urlsplit(url).netloc):` — занять per-domain слот.
+4. `result = await fetcher.fetch(client, url)` — внутри слота.
+5. если `result.error is not None` → учесть `errors`, `continue`; иначе учесть
+   `visited` (и запомнить `result.status` для отчёта).
+6. `for link in fetcher.extract_links(url, result.body):` при `depth+1 <= max_depth`
+   — `queue.put_nowait((link, depth+1))` (дедуп-фильтр выполнит шаг 1 у воркера,
+   забравшего ссылку).
+
+**Пул воркеров и завершение:** `total_workers` задач-`asyncio.Task`, каждая в
+цикле `item = await queue.get()` → конвейер → `queue.task_done()`. Корректный
+стоп: `await queue.join()` (ждёт, пока все положенные элементы обработаны), затем
+все воркер-таски отменяются (`task.cancel()` + `gather(..., return_exceptions=True)`).
+Каждый воркер **обязан** вызвать `task_done()` в `finally` даже при исключении,
+иначе `queue.join()` зависнет.
+
+**Счётчики (структура отчёта):** агрегируем `visited`, `skipped_dedup`,
+`skipped_robots`, `errors` — глобально и в разбивке по хосту
+(`dict[str, Counter]`). Печать в stdout: итоговые числа, таблица по доменам,
+общее время (`time.perf_counter()` вокруг обхода). Точный текстовый формат —
+на усмотрение реализации, но перечисленные счётчики обязаны присутствовать.
 
 **Тесты (respx):** мок мини-сайта из нескольких связанных страниц; проверка что
-`--max-depth` реально режет глубину; отчёт содержит корректные счётчики;
-end-to-end проход по фейковому графу страниц.
+`--max-depth` реально режет глубину (страницы за пределом не запрашиваются —
+`route.call_count`); отчёт содержит корректные счётчики; end-to-end проход по
+фейковому графу; страница с `Disallow` и дубль-ссылка учитываются в
+`skipped_robots`/`skipped_dedup`, а не в `visited`.
 
 **Готово когда:** `politecrawl <seed> --max-depth 2` обходит фейк-сайт и печатает отчёт.
 
