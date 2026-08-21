@@ -1,22 +1,256 @@
 """CLI-точка входа politecrawl.
 
 Этап 5: разбор аргументов (seed-URL, max-depth, per-domain concurrency),
-запуск обхода и печать итогового отчёта.
+запуск конкурентного обхода с ограничением глубины и печать итогового отчёта.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import sys
+import time
+from collections import Counter
+from urllib.parse import urlsplit
+
+import httpx
+
+from politecrawl.dedup import UrlDedup
+from politecrawl.fetcher import extract_links, fetch
+from politecrawl.ratelimit import PerDomainLimiter
+from politecrawl.robots import RobotsCache
+
+
+class CrawlStats:
+    """Aggregated crawl counters: totals plus a per-host breakdown.
+
+    Mutated only from crawl workers running in ONE event loop. Every increment
+    is a plain dict/Counter mutation with no await between read and write, so it
+    is atomic within an event-loop step — no lock is needed (single-threaded
+    asyncio, cooperative scheduling). See TECHNICAL_PLAN §Этап 5.
+    """
+
+    def __init__(self) -> None:
+        self.visited = 0
+        self.skipped_dedup = 0
+        self.skipped_robots = 0
+        self.errors = 0
+        self.per_host: dict[str, Counter[str]] = {}
+
+    def _bump(self, host: str, key: str) -> None:
+        self.per_host.setdefault(host, Counter())[key] += 1
+
+    def record_visited(self, host: str) -> None:
+        self.visited += 1
+        self._bump(host, "visited")
+
+    def record_skipped_dedup(self, host: str) -> None:
+        self.skipped_dedup += 1
+        self._bump(host, "skipped_dedup")
+
+    def record_skipped_robots(self, host: str) -> None:
+        self.skipped_robots += 1
+        self._bump(host, "skipped_robots")
+
+    def record_error(self, host: str) -> None:
+        self.errors += 1
+        self._bump(host, "errors")
+
+
+class Crawler:
+    """Depth-limited concurrent crawler assembled from Stage 1-4 modules.
+
+    Must be constructed inside a running event loop: the frontier queue and
+    the locks inside RobotsCache/PerDomainLimiter bind to the current loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        robots: RobotsCache,
+        limiter: PerDomainLimiter,
+        dedup: UrlDedup,
+        max_depth: int,
+        user_agent: str,
+    ) -> None:
+        self._client = client
+        self._robots = robots
+        self._limiter = limiter
+        self._dedup = dedup
+        self._max_depth = max_depth
+        self._user_agent = user_agent
+        self._queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+        self.stats = CrawlStats()
+
+    async def run(self, seeds: list[str], total_workers: int) -> None:
+        """Crawl from seeds with a pool of workers until the frontier drains."""
+        # Enqueue seeds BEFORE starting workers so queue.join() cannot return
+        # on a momentarily empty queue.
+        for seed in seeds:
+            self._queue.put_nowait((seed, 0))
+        workers = [asyncio.create_task(self._worker()) for _ in range(total_workers)]
+        try:
+            await self._queue.join()  # wait until the frontier is drained
+        finally:
+            for w in workers:
+                w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _worker(self) -> None:
+        """Take frontier items forever; task_done() strictly in finally.
+
+        Network errors are absorbed by fetch() and counted in stats, but
+        _process can still raise on malformed input (e.g. urlsplit() rejects
+        some malformed hrefs found on real pages). Such exceptions are caught
+        here and counted as errors instead of killing this worker task, which
+        would otherwise shrink the pool and could hang queue.join() forever.
+        CancelledError is a BaseException and is not caught, so run()'s
+        cancellation still stops the worker promptly.
+        """
+        while True:
+            url, depth = await self._queue.get()
+            try:
+                await self._process(url, depth)
+            except Exception:
+                self.stats.record_error(self._safe_host(url))
+            finally:
+                self._queue.task_done()
+
+    @staticmethod
+    def _safe_host(url: str) -> str:
+        """urlsplit(url).netloc, falling back to the raw url if unparsable."""
+        try:
+            return urlsplit(url).netloc
+        except ValueError:
+            return url
+
+    async def _process(self, url: str, depth: int) -> None:
+        """Pipeline for one URL: dedup -> robots -> rate-limited fetch -> links."""
+        host = self._safe_host(url)
+
+        # 1. dedup: atomic check-and-insert. Already seen -> skipped_dedup.
+        if not self._dedup.add(url):
+            self.stats.record_skipped_dedup(host)
+            return
+
+        # 2. robots: disallowed -> skipped_robots (checked BEFORE the fetch).
+        if not await self._robots.allowed(url, self._user_agent):
+            self.stats.record_skipped_robots(host)
+            return
+
+        # 3-4. per-domain slot held only around the fetch itself.
+        async with self._limiter.slot(host):
+            result = await fetch(self._client, url)
+
+        # 5. transport error -> errors; otherwise visited.
+        if result.error is not None:
+            self.stats.record_error(host)
+            return
+        self.stats.record_visited(host)
+
+        # 6. extract links and enqueue them if depth allows. Duplicates are
+        # enqueued unfiltered: step 1 of the worker that picks them up is the
+        # single atomic dedup point.
+        if depth + 1 <= self._max_depth:
+            for link in extract_links(url, result.body):
+                self._queue.put_nowait((link, depth + 1))
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="politecrawl",
+        description="Polite structural async web crawler.",
+    )
+    parser.add_argument("seeds", nargs="+", help="one or more seed URLs")
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=2,
+        help="crawl depth from each seed (seed = depth 0)",
+    )
+    parser.add_argument(
+        "--per-domain-concurrency",
+        type=int,
+        default=2,
+        help="max concurrent requests to a single host",
+    )
+    parser.add_argument(
+        "--total-workers",
+        type=int,
+        default=8,
+        help="size of the worker pool",
+    )
+    parser.add_argument(
+        "--user-agent",
+        type=str,
+        default="politecrawl/0.0",
+        help="User-Agent for requests and robots.can_fetch",
+    )
+    return parser
+
+
+async def _run(
+    seeds: list[str],
+    *,
+    max_depth: int,
+    per_domain_concurrency: int,
+    total_workers: int,
+    user_agent: str,
+) -> tuple[CrawlStats, float]:
+    """Build the client and dependencies inside the event loop and crawl."""
+    start = time.perf_counter()
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers={"user-agent": user_agent},
+    ) as client:
+        crawler = Crawler(
+            client=client,
+            robots=RobotsCache(client),
+            limiter=PerDomainLimiter(per_domain_concurrency),
+            dedup=UrlDedup(),
+            max_depth=max_depth,
+            user_agent=user_agent,
+        )
+        await crawler.run(seeds, total_workers)
+    elapsed = time.perf_counter() - start
+    return crawler.stats, elapsed
+
+
+def _format_report(stats: CrawlStats, elapsed: float) -> str:
+    lines = [
+        "politecrawl report",
+        f"  visited:        {stats.visited}",
+        f"  skipped_dedup:  {stats.skipped_dedup}",
+        f"  skipped_robots: {stats.skipped_robots}",
+        f"  errors:         {stats.errors}",
+        f"  elapsed:        {elapsed:.3f}s",
+        "",
+        "per host:",
+    ]
+    for host in sorted(stats.per_host):
+        c = stats.per_host[host]
+        lines.append(
+            f"  {host}  visited={c['visited']} "
+            f"skipped_dedup={c['skipped_dedup']} "
+            f"skipped_robots={c['skipped_robots']} errors={c['errors']}"
+        )
+    return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Точка входа CLI. Пока заглушка — реальный обход появится на Этапе 5."""
-    args = sys.argv[1:] if argv is None else argv
-    # TODO(Этап 5): argparse — seed-URL(ы), --max-depth, --per-domain-concurrency, --user-agent
-    # TODO(Этап 5): собрать Crawler из fetcher/robots/ratelimit/dedup и запустить asyncio.run(...)
-    # TODO(Этап 5): напечатать отчёт по итогам обхода (посещено/пропущено/ошибки; по доменам)
-    _ = args
-    print("politecrawl: заглушка CLI (реализация — Этап 5)")
+    """Точка входа CLI: разобрать аргументы, обойти граф, напечатать отчёт."""
+    args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    stats, elapsed = asyncio.run(
+        _run(
+            args.seeds,
+            max_depth=args.max_depth,
+            per_domain_concurrency=args.per_domain_concurrency,
+            total_workers=args.total_workers,
+            user_agent=args.user_agent,
+        )
+    )
+    print(_format_report(stats, elapsed))
     return 0
 
 
