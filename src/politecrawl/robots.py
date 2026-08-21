@@ -38,6 +38,17 @@ class RobotsCache:
         rfp = await self._get_parser(key)
         return rfp.can_fetch(user_agent, url)
 
+    async def crawl_delay(self, url: str, user_agent: str) -> float | None:
+        """Return the site's declared Crawl-delay (seconds) for user_agent, if any.
+
+        Uses the same cached parser as allowed(): no extra network round-trip
+        for a host whose robots.txt is already loaded. Returns None when the
+        directive is absent (stdlib RobotFileParser.crawl_delay semantics).
+        """
+        rfp = await self._get_parser(_host_key(url))
+        delay = rfp.crawl_delay(user_agent)
+        return None if delay is None else float(delay)
+
     async def _get_parser(self, key: str) -> urllib.robotparser.RobotFileParser:
         """Return the cached parser for key, loading robots.txt exactly once.
 
