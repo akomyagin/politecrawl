@@ -1,10 +1,12 @@
 """HTTP-загрузка страниц и извлечение ссылок.
 
 Этап 1: базовый asyncio-fetch через httpx.AsyncClient + парсинг ссылок.
+Этап 8: extract_sitemap_urls — парсинг sitemap XML (urlset / sitemapindex).
 """
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
@@ -117,3 +119,43 @@ def extract_title(html: str) -> str | None:
     parser = _TitleParser()
     parser.feed(html)
     return parser.title
+
+
+def _local_tag(tag: str) -> str:
+    """Local element name with any {namespace} prefix stripped."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def extract_sitemap_urls(xml: str) -> tuple[list[str], list[str]]:
+    """Parse a sitemap XML, returning (page_urls, nested_sitemap_urls).
+
+    Handles both sitemaps.org 0.9 document types:
+      - <urlset>:      <url><loc> entries -> page_urls
+      - <sitemapindex>: <sitemap><loc> entries -> nested_sitemap_urls
+    Namespace-agnostic (matches by local tag name, tolerating a missing or
+    unexpected xmlns). Malformed XML yields ([], []) — a bad sitemap must not
+    crash the crawl. Only http/https <loc> values are kept.
+    """
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return [], []
+    page_urls: list[str] = []
+    nested_sitemap_urls: list[str] = []
+    root_tag = _local_tag(root.tag)
+    if root_tag == "urlset":
+        target, entry_tag = page_urls, "url"
+    elif root_tag == "sitemapindex":
+        target, entry_tag = nested_sitemap_urls, "sitemap"
+    else:
+        return [], []
+    for entry in root:
+        if _local_tag(entry.tag) != entry_tag:
+            continue
+        for child in entry:
+            if _local_tag(child.tag) != "loc" or not child.text:
+                continue
+            loc = child.text.strip()
+            if urlsplit(loc).scheme in {"http", "https"}:
+                target.append(loc)
+    return page_urls, nested_sitemap_urls

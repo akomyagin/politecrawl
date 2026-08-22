@@ -114,6 +114,55 @@ async def test_crawl_delay_absent_is_none() -> None:
         assert await cache.crawl_delay("https://example.com/page", UA) is None
 
 
+# --- sitemaps (Этап 8) -------------------------------------------------------
+
+
+@respx.mock
+async def test_sitemaps_parsed() -> None:
+    respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=(
+                "User-agent: *\nDisallow: /private\n"
+                "Sitemap: https://example.com/sitemap.xml\n"
+                "Sitemap: https://example.com/sitemap-news.xml\n"
+            ),
+        )
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        cache = RobotsCache(client)
+        assert await cache.sitemaps("https://example.com/page", UA) == [
+            "https://example.com/sitemap.xml",
+            "https://example.com/sitemap-news.xml",
+        ]
+
+
+@respx.mock
+async def test_sitemaps_absent_is_empty() -> None:
+    respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /private\n")
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        cache = RobotsCache(client)
+        assert await cache.sitemaps("https://example.com/page", UA) == []
+
+
+@respx.mock
+async def test_sitemaps_uses_cached_parser() -> None:
+    route = respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text="User-agent: *\nSitemap: https://example.com/sitemap.xml\n",
+        )
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        cache = RobotsCache(client)
+        assert await cache.allowed("https://example.com/page", UA) is True
+        sitemaps = await cache.sitemaps("https://example.com/page", UA)
+    assert sitemaps == ["https://example.com/sitemap.xml"]
+    assert route.call_count == 1  # no second robots.txt download
+
+
 @respx.mock
 async def test_http_and_https_cached_separately() -> None:
     respx.get("http://example.com/robots.txt").mock(

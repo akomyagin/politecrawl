@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import respx
 
-from politecrawl.fetcher import extract_links, extract_title, fetch
+from politecrawl.fetcher import extract_links, extract_sitemap_urls, extract_title, fetch
 
 # --- fetch -----------------------------------------------------------------
 
@@ -148,6 +148,54 @@ def test_extract_title_empty_is_none() -> None:
 
 def test_extract_title_first_wins() -> None:
     assert extract_title("<title>First</title><title>Second</title>") == "First"
+
+
+# --- extract_sitemap_urls (Этап 8) ------------------------------------------
+
+SITEMAP_XMLNS = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+
+
+def test_extract_sitemap_urls_urlset() -> None:
+    xml = (
+        f"<urlset {SITEMAP_XMLNS}>"
+        "<url><loc>https://x/a</loc></url>"
+        "<url><loc>https://x/b</loc></url>"
+        "</urlset>"
+    )
+    assert extract_sitemap_urls(xml) == (["https://x/a", "https://x/b"], [])
+
+
+def test_extract_sitemap_urls_index() -> None:
+    xml = (
+        f"<sitemapindex {SITEMAP_XMLNS}>"
+        "<sitemap><loc>https://x/sm1.xml</loc></sitemap>"
+        "<sitemap><loc>https://x/sm2.xml</loc></sitemap>"
+        "</sitemapindex>"
+    )
+    assert extract_sitemap_urls(xml) == ([], ["https://x/sm1.xml", "https://x/sm2.xml"])
+
+
+def test_extract_sitemap_urls_malformed() -> None:
+    assert extract_sitemap_urls("this is not xml <<<") == ([], [])
+
+
+def test_extract_sitemap_urls_no_namespace() -> None:
+    xml = "<urlset><url><loc>https://x/a</loc></url></urlset>"
+    assert extract_sitemap_urls(xml) == (["https://x/a"], [])
+
+
+def test_extract_sitemap_urls_filters_non_http() -> None:
+    xml = (
+        f"<urlset {SITEMAP_XMLNS}>"
+        "<url><loc>ftp://x/file</loc></url>"
+        "<url><loc>https://x/ok</loc></url>"
+        "</urlset>"
+    )
+    assert extract_sitemap_urls(xml) == (["https://x/ok"], [])
+
+
+def test_extract_sitemap_urls_empty() -> None:
+    assert extract_sitemap_urls(f"<urlset {SITEMAP_XMLNS}/>") == ([], [])
 
 
 # --- integration -----------------------------------------------------------

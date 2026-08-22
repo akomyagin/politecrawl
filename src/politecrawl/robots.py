@@ -49,6 +49,17 @@ class RobotsCache:
         delay = rfp.crawl_delay(user_agent)
         return None if delay is None else float(delay)
 
+    async def sitemaps(self, url: str, user_agent: str) -> list[str]:
+        """Return sitemap URLs declared in the host's robots.txt (may be empty).
+
+        Uses the same cached parser as allowed()/crawl_delay(): no extra network
+        round-trip. site_maps() ignores user_agent (Sitemap: is a global
+        directive, not per-agent); the parameter is kept for call-site symmetry
+        with allowed()/crawl_delay().
+        """
+        rfp = await self._get_parser(_host_key(url))
+        return rfp.site_maps() or []
+
     async def _get_parser(self, key: str) -> urllib.robotparser.RobotFileParser:
         """Return the cached parser for key, loading robots.txt exactly once.
 

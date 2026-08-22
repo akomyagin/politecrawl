@@ -25,7 +25,7 @@ from politecrawl.export import (
     write_pages,
     write_sitemap,
 )
-from politecrawl.fetcher import extract_links, extract_title, fetch
+from politecrawl.fetcher import extract_links, extract_sitemap_urls, extract_title, fetch
 from politecrawl.ratelimit import PerDomainLimiter
 from politecrawl.robots import RobotsCache
 
@@ -44,6 +44,7 @@ class CrawlStats:
         self.skipped_dedup = 0
         self.skipped_robots = 0
         self.errors = 0
+        self.sitemap_urls = 0
         self.per_host: dict[str, Counter[str]] = {}
 
     def _bump(self, host: str, key: str) -> None:
@@ -64,6 +65,16 @@ class CrawlStats:
     def record_error(self, host: str) -> None:
         self.errors += 1
         self._bump(host, "errors")
+
+    def record_sitemap_url(self, host: str) -> None:
+        """Count a page URL discovered in a sitemap and enqueued (Stage 8).
+
+        Counts discovery, not visits: some of these URLs are later dropped at
+        the fence by dedup/robots. That is intentional — the counter reflects
+        the sitemap's contribution as a link source.
+        """
+        self.sitemap_urls += 1
+        self._bump(host, "sitemap_urls")
 
 
 class Crawler:
@@ -97,6 +108,12 @@ class Crawler:
         # (same precedent as CrawlStats/UrlDedup, Stages 4-5).
         self.edges: list[Edge] = []
         self.pages: list[PageMeta] = []
+        # Sitemap discovery state (Stage 8). Both sets are mutated with plain
+        # check-and-insert (no await between read and write), so mutation is
+        # atomic within an event-loop step — same lock-free precedent as
+        # UrlDedup.add and the edges/pages accumulators above.
+        self._sitemap_hosts: set[str] = set()  # hosts whose discovery already ran
+        self._fetched_sitemaps: set[str] = set()  # sitemap URLs already fetched
 
     async def run(self, seeds: list[str], total_workers: int) -> None:
         """Crawl from seeds with a pool of workers until the frontier drains."""
@@ -154,6 +171,14 @@ class Crawler:
             self.stats.record_skipped_robots(host)
             return
 
+        # 2b. sitemap discovery (Stage 8): once per host, only for depth-0 seeds
+        # that passed robots. Enqueues sitemap-declared page URLs as additional
+        # depth-0 entry points. The check-and-add guard has no await between
+        # read and write, so it runs once per host across all workers.
+        if depth == 0 and host not in self._sitemap_hosts:
+            self._sitemap_hosts.add(host)
+            await self._discover_sitemaps(url)
+
         # 3-4. per-domain slot held only around the fetch itself. Crawl-delay
         # comes from the already-warmed RobotsCache (same robots.txt loaded on
         # step 2 for allowed() — no extra network round-trip).
@@ -191,6 +216,56 @@ class Crawler:
         if depth + 1 <= self._max_depth:
             for link in links:
                 self._queue.put_nowait((link, depth + 1))
+
+    async def _discover_sitemaps(self, seed_url: str) -> None:
+        """Fetch sitemaps declared in the seed host's robots.txt (Stage 8).
+
+        Sitemap URLs come from the already-warmed RobotsCache (the same
+        robots.txt loaded for allowed() on step 2 — no extra network
+        round-trip). Page URLs found in sitemaps are enqueued at depth 0: a
+        sitemap is the site's declared list of canonical entry points, so they
+        crawl their own outgoing links to the full max_depth. They still pass
+        the normal dedup -> robots -> rate-limited fetch pipeline in _process.
+
+        <sitemapindex> is expanded exactly ONE level: child sitemaps of an
+        index are fetched, but an index nested inside another index is not
+        recursed into (POST_MVP). Fetch/parse failures are absorbed by
+        fetch()/extract_sitemap_urls, so a bad sitemap never crashes the seed's
+        own processing.
+        """
+        for sitemap_url in await self._robots.sitemaps(seed_url, self._user_agent):
+            for child_url in await self._ingest_sitemap(sitemap_url):
+                # One level only: nested sitemaps declared by a child index
+                # are ignored (returned list is dropped).
+                await self._ingest_sitemap(child_url)
+
+    async def _ingest_sitemap(self, sitemap_url: str) -> list[str]:
+        """Fetch one sitemap politely and enqueue its page URLs at depth 0.
+
+        Returns nested sitemap URLs when the document is a <sitemapindex>
+        (empty for a plain <urlset>, an already-fetched sitemap, or any
+        fetch/parse failure). The fetch goes through the same per-domain
+        limiter slot (concurrency cap + crawl-delay + backoff) as page
+        fetches: a sitemap download is a request to the domain like any other.
+        """
+        # Atomic check-and-insert (no await in between): each sitemap URL is
+        # fetched at most once per crawl, even when several indexes share
+        # child sitemaps or hosts declare the same sitemap.
+        if sitemap_url in self._fetched_sitemaps:
+            return []
+        self._fetched_sitemaps.add(sitemap_url)
+        host = self._safe_host(sitemap_url)
+        delay = await self._robots.crawl_delay(sitemap_url, self._user_agent)
+        async with self._limiter.slot(host, crawl_delay=delay or 0.0):
+            result = await fetch(self._client, sitemap_url)
+        self._limiter.record_response(host, result.status)
+        if result.error is not None:
+            return []
+        page_urls, nested_sitemap_urls = extract_sitemap_urls(result.body)
+        for page_url in page_urls:
+            self.stats.record_sitemap_url(self._safe_host(page_url))
+            self._queue.put_nowait((page_url, 0))
+        return nested_sitemap_urls
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -281,6 +356,7 @@ def _format_report(stats: CrawlStats, elapsed: float) -> str:
         f"  skipped_dedup:  {stats.skipped_dedup}",
         f"  skipped_robots: {stats.skipped_robots}",
         f"  errors:         {stats.errors}",
+        f"  sitemap_urls:   {stats.sitemap_urls}",
         f"  elapsed:        {elapsed:.3f}s",
         "",
         "per host:",
@@ -290,7 +366,8 @@ def _format_report(stats: CrawlStats, elapsed: float) -> str:
         lines.append(
             f"  {host}  visited={c['visited']} "
             f"skipped_dedup={c['skipped_dedup']} "
-            f"skipped_robots={c['skipped_robots']} errors={c['errors']}"
+            f"skipped_robots={c['skipped_robots']} errors={c['errors']} "
+            f"sitemap_urls={c['sitemap_urls']}"
         )
     return "\n".join(lines)
 
