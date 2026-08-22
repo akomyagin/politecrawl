@@ -435,6 +435,177 @@ self._limiter.record_response(host, result.status)
 
 ---
 
+## Этап 7 — Экспорт результатов обхода (POST_MVP)
+
+**Цель:** дать структурированный вывод обхода поверх текстового отчёта Этапа 5.
+Три опциональных экспорта, включаемых CLI-флагами (по умолчанию выключены — обход
+не зависит от экспорта):
+- **граф ссылок** — рёбра «страница → исходящая ссылка» в JSONL или CSV;
+- **sitemap-подобный XML** — все успешно посещённые URL;
+- **дамп метаданных страниц** — `url`, `status`, `content_type`, `title` в JSONL
+  или CSV.
+
+Экспорт — чистая фаза сериализации ПОСЛЕ обхода: `Crawler` копит данные по ходу
+конвейера, а запись файлов происходит один раз в конце, из уже собранных
+списков. Это отделяет форматирование (без сети/async) от обхода и делает
+`export.py` тестируемым без `respx`.
+
+**Модули:** новый `export.py` (чистые функции сериализации), `fetcher.py`
+(+`extract_title`), `cli.py` (сбор данных в `Crawler` + флаги + вызов экспорта).
+
+### `fetcher.py` — `extract_title`
+
+`<title>` сейчас нигде не извлекается. Добавляется чистая функция рядом с
+`extract_links`, тем же `HTMLParser`-подходом; контракты `extract_links` и
+`FetchResult` **не меняются** (title извлекается в `cli.py` из `result.body`, а не
+хранится в `FetchResult` — это не трогает существующие места создания
+`FetchResult` в тестах fetcher/cli).
+
+```python
+def extract_title(html: str) -> str | None:
+    """Return the text of the first <title>…</title>, or None if absent.
+
+    Whitespace is collapsed and trimmed. Only the first <title> is used;
+    empty or whitespace-only titles yield None.
+    """
+```
+
+Отдельный `_TitleParser(HTMLParser)`: ловит вход в `<title>` (флаг в
+`handle_starttag`), собирает текст в `handle_data`, закрывает на `</title>`. Первый
+встреченный title фиксируется; парсинг можно не прерывать (HTMLParser не бросает).
+
+### `export.py` — контракт
+
+Чистые синхронные функции. Принимают уже собранные данные + путь, пишут файл.
+Без импорта `httpx`/`asyncio`. Типы данных:
+
+```python
+Edge = tuple[str, str]               # (source_url, target_url)
+PageMeta = dict[str, str | int | None]  # keys: url, status, content_type, title
+```
+
+Публичные функции:
+
+```python
+def write_edges(edges: list[Edge], path: str) -> None: ...
+def write_pages(pages: list[PageMeta], path: str) -> None: ...
+def write_sitemap(urls: list[str], path: str) -> None: ...   # always XML
+```
+
+- `write_edges` / `write_pages` выбирают формат **по расширению пути**:
+  `.jsonl` → JSON Lines (по объекту на строку), `.csv` → CSV с заголовком.
+  Нераспознанное расширение → `ExportFormatError` (см. ниже).
+- `write_sitemap` игнорирует расширение (формат всегда XML), но пишет по
+  переданному пути.
+- **Формат ошибки:** модуль объявляет `class ExportFormatError(ValueError)`.
+  `_format_from_path(path) -> str` нормализует суффикс (`.JSONL` → `jsonl`) и
+  бросает `ExportFormatError` с человекочитаемым сообщением на нераспознанном.
+  `cli.main` ловит `ExportFormatError`, печатает сообщение в `stderr` и
+  возвращает код выхода `2` — **никакого traceback пользователю**.
+- **JSONL:** `json.dumps(obj, ensure_ascii=False)` на строку, финальный `\n`.
+- **CSV:** `csv.DictWriter` со стабильным порядком колонок; `edges` — колонки
+  `source,target`; `pages` — `url,status,content_type,title`. `None` → пустая
+  ячейка (CSV) / `null` (JSON естественно).
+- **Sitemap XML:** корень `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`,
+  на каждый URL `<url><loc>ESC(url)</loc></url>`. `xml.sax.saxutils.escape` на
+  `<loc>`. Заголовок `<?xml version="1.0" encoding="UTF-8"?>`.
+- Все функции пишут через `open(path, "w", encoding="utf-8", newline="")`
+  (для CSV `newline=""` обязателен).
+
+### `cli.py` — сбор данных и проводка
+
+**Сбор в `Crawler`** (новые атрибуты, мутируются в одном event loop без лока — по
+прецеденту `CrawlStats`/`UrlDedup`, Этапы 4-5):
+- `self.edges: list[Edge]` — на **шаге 6** конвейера, при извлечении ссылок:
+  фиксируется пара `(url, link)` для КАЖДОЙ исходящей ссылки, **до** проверки
+  глубины/дедупа/robots — это граф ссылок, а не граф обхода. Рёбра пишутся, даже
+  если target не будет поставлен в очередь (за пределом глубины) или отсеётся
+  дедупом/robots при заборе.
+- `self.pages: list[PageMeta]` — на **шаге 5**, когда `result.error is None`:
+  `{"url": url, "status": result.status, "content_type": result.content_type,
+  "title": extract_title(result.body)}`. Только успешно полученные страницы
+  (совпадает с `record_visited`).
+
+**Инвариант рёбер:** `edges` собираются в блоке `if depth + 1 <= self._max_depth`?
+**Нет** — вопрос принципиальный. Рёбра фиксируются для всех исходящих ссылок
+страницы **независимо от `max_depth`**: даже если ссылки не ставятся в очередь
+(за пределом глубины), сам факт «страница ссылается на» — часть графа. То есть
+`extract_links(url, result.body)` вызывается всегда при успешном fetch, из него
+пишутся рёбра; постановка в очередь под `max_depth` — отдельная ветка на том же
+списке ссылок. (Уточнение к существующему шагу 6: раньше `extract_links` звался
+только внутри `if depth+1<=max_depth`; теперь — всегда, а условие глубины режет
+только `put_nowait`.)
+
+**Флаги** (`_build_parser`, опциональные, дефолт `None` = выключено):
+- `--export-edges PATH` — граф ссылок (формат по расширению `.jsonl`/`.csv`);
+- `--export-sitemap PATH` — sitemap XML посещённых URL;
+- `--export-pages PATH` — метаданные страниц (`.jsonl`/`.csv`).
+
+**Экспорт после обхода** (в `main`, после печати отчёта — или в отдельной функции
+`_run_exports(crawler, args)`): для каждого не-`None` флага вызвать
+соответствующую `write_*`. `sitemap` берёт `[p["url"] for p in crawler.pages]`
+(только реально посещённые). Обёрнуто в `try/except ExportFormatError` →
+сообщение в stderr + `return 2`.
+
+`_run` должен возвращать сам `Crawler` (а не только `stats, elapsed`), чтобы
+`main` имел доступ к `crawler.edges`/`crawler.pages`. Сигнатура меняется на
+`tuple[Crawler, float]`; `main` берёт `crawler.stats` для отчёта — существующий
+тест-контракт `_run` затрагивается, проверить `tests/test_cli.py`.
+
+### Тесты
+
+`tests/test_export.py` (новый, **без сети/respx** — чистые функции; читают
+записанный файл через `tmp_path`):
+- `test_write_edges_jsonl` / `test_write_edges_csv` — формат по расширению,
+  содержимое парсится обратно, порядок рёбер сохранён.
+- `test_write_pages_jsonl` / `test_write_pages_csv` — все ключи, `None`
+  сериализуется корректно (пустая ячейка в CSV / `null` в JSON).
+- `test_write_sitemap_xml` — валидный XML, все URL в `<loc>`, спецсимволы
+  (`&`, `<`) экранированы.
+- `test_unrecognized_extension_raises` — `write_edges(..., "out.txt")` бросает
+  `ExportFormatError`.
+- `test_extension_case_insensitive` — `.JSONL`/`.CSV` распознаются.
+
+`tests/test_fetcher.py`:
+- `test_extract_title_basic` — `<title>Hi</title>` → `"Hi"`.
+- `test_extract_title_absent` — нет `<title>` → `None`.
+- `test_extract_title_whitespace_collapsed` — многострочный/пробельный title
+  сворачивается; пустой → `None`.
+
+`tests/test_cli.py` (`@respx.mock`):
+- `test_crawler_collects_edges` — граф со ссылками; `crawler.edges` содержит
+  ожидаемые пары `(source, target)`, включая ссылки за пределом `max_depth`.
+- `test_crawler_collects_pages_with_title` — страницы с `<title>`;
+  `crawler.pages` содержит `url/status/content_type/title` посещённых.
+- `test_export_flags_write_files` — `main([seed, "--export-edges", edges_path,
+  "--export-pages", pages_path, "--export-sitemap", sitemap_path])` через
+  `tmp_path`; файлы созданы и содержат данные.
+- `test_export_bad_extension_exits_nonzero` — `main([..., "--export-edges",
+  "x.txt"])` возвращает `2`, сообщение в stderr (через `capsys`), без traceback.
+- `test_no_export_flags_writes_nothing` — без флагов файлы не создаются, поведение
+  обхода не меняется.
+
+### Границы / что НЕ входит
+
+- Не менять `FetchResult` и `extract_links` — title извлекается отдельной чистой
+  функцией из `result.body`, хранится только в `crawler.pages`.
+- Не потоковый экспорт: файлы пишутся один раз в конце из накопленных списков
+  (для single-machine скоупа с ограниченной глубиной память не проблема — как и
+  `set` в дедупе, Этап 4).
+- Sitemap — только `<loc>` (без `<lastmod>`/`<priority>`/`<changefreq>`): у
+  краулера нет этих данных, добавлять пустые теги смысла нет.
+- Дедуп рёбер не делается: граф ссылок отражает страницу как есть (та же ссылка
+  дважды на странице = два ребра), это соответствует `extract_links`, который
+  сохраняет дубли.
+
+**Готово когда:** обход с `--export-edges out.jsonl --export-pages pages.csv
+--export-sitemap sitemap.xml` пишет три корректных файла (граф рёбер, метаданные
+с извлечёнными title, sitemap посещённых URL); без флагов ничего не пишется и
+обход не меняется; путь с нераспознанным расширением даёт понятную ошибку и
+ненулевой код выхода, а не traceback.
+
+---
+
 ## Сквозные принципы
 
 - **Ошибки не роняют обход** — сетевые/парсинг-ошибки логируются и учитываются в отчёте.

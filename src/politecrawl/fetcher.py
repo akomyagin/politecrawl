@@ -78,3 +78,42 @@ def extract_links(base_url: str, html: str) -> list[str]:
         if urlsplit(absolute).scheme in {"http", "https"}:
             links.append(absolute)
     return links
+
+
+class _TitleParser(HTMLParser):
+    """Captures the text of the first <title>…</title> element."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_title = False
+        self._done = False
+        self._chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "title" and not self._done:
+            self._in_title = True
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title" and self._in_title:
+            self._in_title = False
+            self._done = True
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title and not self._done:
+            self._chunks.append(data)
+
+    @property
+    def title(self) -> str | None:
+        text = " ".join("".join(self._chunks).split())
+        return text or None
+
+
+def extract_title(html: str) -> str | None:
+    """Return the text of the first <title>…</title>, or None if absent.
+
+    Whitespace is collapsed to single spaces and trimmed; an empty or
+    whitespace-only title yields None. Only the first <title> is used.
+    """
+    parser = _TitleParser()
+    parser.feed(html)
+    return parser.title

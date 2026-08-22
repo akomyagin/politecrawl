@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import respx
 
-from politecrawl.fetcher import extract_links, fetch
+from politecrawl.fetcher import extract_links, extract_title, fetch
 
 # --- fetch -----------------------------------------------------------------
 
@@ -125,6 +125,29 @@ def test_extract_links_preserves_order_and_duplicates() -> None:
         "https://example.com/b",
         "https://example.com/a",
     ]
+
+
+# --- extract_title ---------------------------------------------------------
+
+
+def test_extract_title_basic() -> None:
+    assert extract_title("<html><head><title>Hi</title></head></html>") == "Hi"
+
+
+def test_extract_title_absent() -> None:
+    assert extract_title("<html><body>x</body></html>") is None
+
+
+def test_extract_title_whitespace_collapsed() -> None:
+    assert extract_title("<title>\n  Hello   World\n</title>") == "Hello World"
+
+
+def test_extract_title_empty_is_none() -> None:
+    assert extract_title("<title>   </title>") is None
+
+
+def test_extract_title_first_wins() -> None:
+    assert extract_title("<title>First</title><title>Second</title>") == "First"
 
 
 # --- integration -----------------------------------------------------------

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from pathlib import Path
 
 import httpx
 import pytest
 import respx
 
-from politecrawl.cli import CrawlStats, _build_parser, _format_report, _run, main
+from politecrawl.cli import Crawler, CrawlStats, _build_parser, _format_report, _run, main
 from politecrawl.ratelimit import PerDomainLimiter
 
 UA = "politecrawl/0.0"
@@ -40,15 +42,19 @@ def _mock_site_graph() -> dict[str, respx.Route]:
     }
 
 
-async def _run_default(max_depth: int = 2) -> CrawlStats:
-    stats, _elapsed = await _run(
+async def _run_crawler(max_depth: int = 2) -> Crawler:
+    crawler, _elapsed = await _run(
         [f"{BASE}/"],
         max_depth=max_depth,
         per_domain_concurrency=2,
         total_workers=4,
         user_agent=UA,
     )
-    return stats
+    return crawler
+
+
+async def _run_default(max_depth: int = 2) -> CrawlStats:
+    return (await _run_crawler(max_depth)).stats
 
 
 # --- argparse ---------------------------------------------------------------
@@ -158,7 +164,7 @@ async def test_malformed_href_does_not_crash_worker() -> None:
     _mock_robots_404()
     _mock_page("/", "<a href='http://[bad'>broken</a><a href='/ok'>ok</a>")
     _mock_page("/ok")
-    stats, _elapsed = await asyncio.wait_for(
+    crawler, _elapsed = await asyncio.wait_for(
         _run(
             [f"{BASE}/"],
             max_depth=1,
@@ -168,6 +174,7 @@ async def test_malformed_href_does_not_crash_worker() -> None:
         ),
         timeout=5.0,
     )
+    stats = crawler.stats
     assert stats.visited == 1  # only the seed; the malformed href never enqueues /ok
     assert stats.errors >= 1
 
@@ -175,7 +182,7 @@ async def test_malformed_href_does_not_crash_worker() -> None:
 @respx.mock
 async def test_join_terminates_no_hang() -> None:
     _mock_site_graph()
-    stats, _elapsed = await asyncio.wait_for(
+    crawler, _elapsed = await asyncio.wait_for(
         _run(
             [f"{BASE}/"],
             max_depth=2,
@@ -185,7 +192,7 @@ async def test_join_terminates_no_hang() -> None:
         ),
         timeout=5.0,
     )
-    assert stats.visited == 4
+    assert crawler.stats.visited == 4
 
 
 @respx.mock
@@ -260,7 +267,7 @@ async def test_crawl_delay_from_robots_applied() -> None:
     )
     _mock_page("/", "<a href='/a'>a</a>")
     _mock_page("/a")
-    stats, elapsed = await asyncio.wait_for(
+    crawler, elapsed = await asyncio.wait_for(
         _run(
             [f"{BASE}/"],
             max_depth=1,
@@ -270,8 +277,8 @@ async def test_crawl_delay_from_robots_applied() -> None:
         ),
         timeout=5.0,
     )
-    assert stats.visited == 2
-    assert stats.errors == 0
+    assert crawler.stats.visited == 2
+    assert crawler.stats.errors == 0
     # первый запрос стартует сразу, второй выжидает crawl-delay целиком
     # (допуск на дрожание планировщика event loop)
     assert elapsed >= 0.9
@@ -299,6 +306,138 @@ async def test_5xx_response_triggers_backoff_call(monkeypatch: pytest.MonkeyPatc
     # 5xx — не транспортная ошибка: страница скачана и посчитана как visited
     assert stats.errors == 0
     assert stats.visited == 2
+
+
+# --- Этап 7: сбор edges/pages и флаги экспорта ------------------------------
+
+
+@respx.mock
+async def test_crawler_collects_edges() -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a><a href='/b'>b</a>")
+    _mock_page("/a", "<a href='/deep'>d</a>")
+    _mock_page("/b")
+    deep_route = _mock_page("/deep")
+    crawler = await _run_crawler(max_depth=1)
+    assert (f"{BASE}/", f"{BASE}/a") in crawler.edges
+    assert (f"{BASE}/", f"{BASE}/b") in crawler.edges
+    # The edge to /deep is recorded even though /deep is beyond max_depth=1:
+    # edges form the LINK graph, not the crawl graph.
+    assert (f"{BASE}/a", f"{BASE}/deep") in crawler.edges
+    assert deep_route.call_count == 0  # ...but the target was never fetched
+
+
+@respx.mock
+async def test_crawler_collects_pages_with_title() -> None:
+    _mock_robots_404()
+    _mock_page("/", "<html><head><title>Root</title></head><a href='/a'>a</a></html>")
+    _mock_page("/a", "<html><head><title>Page A</title></head></html>")
+    crawler = await _run_crawler(max_depth=1)
+    assert len(crawler.pages) == crawler.stats.visited == 2
+    by_url = {p["url"]: p for p in crawler.pages}
+    root = by_url[f"{BASE}/"]
+    assert root["status"] == 200
+    assert isinstance(root["content_type"], str)
+    assert root["content_type"].startswith("text/html")
+    assert root["title"] == "Root"
+    assert by_url[f"{BASE}/a"]["title"] == "Page A"
+
+
+@respx.mock
+async def test_edges_recorded_regardless_of_dedup() -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a", "<a href='/'>back</a>")  # cycle back to the seed
+    crawler = await _run_crawler(max_depth=2)
+    assert crawler.stats.visited == 2  # / fetched once (dedup)
+    # The edge to the already-seen URL is still in the link graph.
+    assert (f"{BASE}/a", f"{BASE}/") in crawler.edges
+
+
+@respx.mock
+async def test_edges_recorded_to_robots_disallowed_target() -> None:
+    respx.get(f"{BASE}/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /private\n")
+    )
+    _mock_page("/", "<a href='/private'>p</a>")
+    private_route = _mock_page("/private")
+    crawler = await _run_crawler(max_depth=1)
+    # The link graph records the edge even though the target is disallowed
+    # by robots and never fetched.
+    assert (f"{BASE}/", f"{BASE}/private") in crawler.edges
+    assert crawler.stats.skipped_robots == 1
+    assert private_route.call_count == 0
+
+
+@respx.mock
+def test_export_flags_write_files(tmp_path: Path) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<html><head><title>Root</title></head><a href='/a'>a</a></html>")
+    _mock_page("/a")
+    edges_path = tmp_path / "e.jsonl"
+    pages_path = tmp_path / "p.csv"
+    sitemap_path = tmp_path / "s.xml"
+    rc = main(
+        [
+            f"{BASE}/",
+            "--max-depth",
+            "1",
+            "--export-edges",
+            str(edges_path),
+            "--export-pages",
+            str(pages_path),
+            "--export-sitemap",
+            str(sitemap_path),
+        ]
+    )
+    assert rc == 0
+    edges = [json.loads(line) for line in edges_path.read_text(encoding="utf-8").splitlines()]
+    assert {"source": f"{BASE}/", "target": f"{BASE}/a"} in edges
+    pages_text = pages_path.read_text(encoding="utf-8")
+    assert pages_text.startswith("url,status,content_type,title")
+    assert f"{BASE}/a" in pages_text
+    sitemap_text = sitemap_path.read_text(encoding="utf-8")
+    assert "<urlset" in sitemap_text
+    assert f"<loc>{BASE}/</loc>" in sitemap_text
+
+
+@respx.mock
+def test_export_bad_extension_exits_nonzero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_robots_404()
+    _mock_page("/")
+    rc = main([f"{BASE}/", "--export-edges", str(tmp_path / "e.txt")])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "e.txt" in captured.err
+    assert "unsupported" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+@respx.mock
+def test_export_bad_extension_before_crawl(tmp_path: Path) -> None:
+    # Extension validation runs BEFORE the crawl: no network traffic at all.
+    _mock_robots_404()
+    seed_route = _mock_page("/")
+    rc = main([f"{BASE}/", "--export-pages", str(tmp_path / "p.bogus")])
+    assert rc == 2
+    assert seed_route.call_count == 0
+
+
+@respx.mock
+def test_no_export_flags_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a")
+    rc = main([f"{BASE}/", "--max-depth", "1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert list(tmp_path.iterdir()) == []  # no export files created
+    assert "visited:        2" in out  # crawl behaviour unchanged
 
 
 # --- report formatting ------------------------------------------------------
