@@ -264,6 +264,177 @@ filter вынесен в POST_MVP (для сценария распределё�
 
 ---
 
+## Этап 6 — Crawl-delay из robots.txt + адаптивный backoff (POST_MVP)
+
+**Цель:** уважать `Crawl-delay:` из robots.txt (явно заявленный сайтом минимальный
+интервал между запросами к домену) и адаптивно увеличивать интервал при ответах
+429/5xx или сетевых ошибках — с постепенным затуханием backoff при успешных
+ответах. Оба поведения — расширение per-domain politeness, уже заложенной в
+Этапах 2-3, а не новая подсистема.
+
+**Модули:** `robots.py` (+1 метод у `RobotsCache`), `ratelimit.py` (расширение
+`PerDomainLimiter`), `cli.py` (проброс `crawl_delay` в `slot()` + вызов
+`record_response()` после fetch — заодно использует `result.status`, который
+Этап 5 вычислял, но не использовал).
+
+### `robots.py` — `RobotsCache.crawl_delay`
+
+```python
+async def crawl_delay(self, url: str, user_agent: str) -> float | None:
+    """Return the site's declared Crawl-delay for user_agent, if any."""
+    rfp = await self._get_parser(_host_key(url))
+    return rfp.crawl_delay(user_agent)
+```
+
+`urllib.robotparser.RobotFileParser.crawl_delay()` — часть stdlib (Python ≥3.6),
+дополнительный парсинг не нужен. Возвращает `None`, если директивы нет.
+
+### `ratelimit.py` — расширение `PerDomainLimiter`
+
+**Новое состояние (в дополнение к `_sems`/`_registry_lock`):**
+- `_next_dispatch: dict[str, float]` — `time.monotonic()`-метка, раньше которой
+  следующий запрос к домену стартовать не может.
+- `_backoff: dict[str, float]` — текущая адаптивная надбавка к интервалу (сек),
+  по умолчанию `0.0`.
+
+**`slot(domain, crawl_delay=0.0)`** — сигнатура расширяется необязательным
+кварг-параметром `crawl_delay: float = 0.0` (обратная совместимость: старые
+вызовы `slot(domain)` продолжают работать, интервал = только backoff, обычно 0).
+Тело: после захвата семафора (как сейчас) — вызвать `_wait_for_dispatch(domain,
+crawl_delay)` и только затем `yield`.
+
+**`_wait_for_dispatch(domain, crawl_delay)` — БЕЗ ЛОКА, по прецеденту
+`UrlDedup.add`/`CrawlStats` (Этапы 4-5):**
+
+```python
+async def _wait_for_dispatch(self, domain: str, crawl_delay: float) -> None:
+    interval = max(crawl_delay, self._backoff.get(domain, 0.0))
+    now = time.monotonic()
+    ready_at = self._next_dispatch.get(domain, now)
+    wait = max(0.0, ready_at - now)
+    # Резервируем следующий слот СИНХРОННО, без await между чтением ready_at
+    # и записью ниже — как и в UrlDedup.add/CrawlStats, это делает резервацию
+    # атомарной в рамках шага event loop без явного лока: два воркера одного
+    # домена не могут получить одинаковый ready_at.
+    self._next_dispatch[domain] = max(ready_at, now) + interval
+    if wait > 0:
+        await asyncio.sleep(wait)
+```
+
+- `interval = max(crawl_delay, backoff)` — берётся более строгое из двух
+  ограничений, а не сумма.
+- Критично: резервация (`_next_dispatch[domain] = ...`) стоит ДО `await
+  asyncio.sleep`, а не после — иначе окно между чтением и записью откроет
+  гонку, и несколько воркеров одного домена смогут одновременно вычислить
+  один и тот же `wait` и стартовать без нужного интервала между собой.
+
+**`record_response(domain, status)` — синхронный метод, вызывается ПОСЛЕ
+`fetch()` (уже вне `async with slot(...)`, слот к этому моменту освобождён):**
+
+```python
+def record_response(self, domain: str, status: int | None) -> None:
+    """Adjust adaptive backoff for domain from one fetch outcome.
+
+    429, 5xx, or a transport error (status=None) doubles the backoff (capped
+    at 60s, floored at 1s on first trigger). Any other status halves it back
+    toward 0. Independent of _next_dispatch — only affects future intervals.
+    """
+    current = self._backoff.get(domain, 0.0)
+    if status is None or status == 429 or status >= 500:
+        self._backoff[domain] = min(60.0, max(1.0, current * 2))
+    elif current > 0.01:
+        self._backoff[domain] = current / 2
+    else:
+        self._backoff[domain] = 0.0
+```
+
+- Пороги (`1.0` старт, `x2` рост, `60.0` потолок, `/2` спад) — фиксированные
+  константы, конфигурируемость через CLI не входит в этот этап.
+- Вызывается один раз на fetch, `domain` — тот же `host`, что уже вычисляется
+  в `cli.py._process` (`urlsplit(url).netloc` / `_safe_host`).
+
+### `cli.py` — проводка
+
+В `Crawler._process`, шаг 3-4 (было: `async with self._limiter.slot(host):
+result = await fetch(...)`):
+
+```python
+delay = await self._robots.crawl_delay(url, self._user_agent)
+async with self._limiter.slot(host, crawl_delay=delay or 0.0):
+    result = await fetch(self._client, url)
+self._limiter.record_response(host, result.status)
+```
+
+- `crawl_delay` запрашивается у уже прогретого `RobotsCache` (тот же
+  `robots.txt`, что грузился на шаге 2 конвейера для `allowed()` — повторного
+  сетевого обращения нет, `_get_parser` кеширует).
+- `record_response` вызывается ПОСЛЕ выхода из `async with slot(...)` (слот уже
+  освобождён — backoff не должен держать семафор занятым дольше самого fetch)
+  и ДО `if result.error is not None:` (порядок с существующими шагами 5-6 ТЗ не
+  меняется, это дополнительный шаг между 4 и 5).
+- `result.status` при транспортной ошибке — `None` (см. `fetcher.FetchResult`);
+  `record_response` обрабатывает `None` как повод для backoff.
+
+### Тесты
+
+`tests/test_ratelimit.py` (стиль как у существующих — реальные малые
+`asyncio.sleep`, проверка порядка/интервалов, без моков времени):
+- `test_crawl_delay_spaces_out_same_domain_requests` — `per_domain=2`,
+  `crawl_delay=0.05`; два воркера в `slot(domain, crawl_delay=0.05)`
+  одновременно; замерить `time.monotonic()` на входе в тело каждого — разница
+  между стартами `>= ~0.05` (с допуском), несмотря на `per_domain=2`
+  (конкурентность не блокирует интервал).
+- `test_crawl_delay_zero_is_noop` — `crawl_delay=0.0` (дефолт) не меняет
+  поведение относительно существующих тестов Этапа 3 (без интервала).
+- `test_no_race_on_concurrent_dispatch_reservation` — много воркеров одного
+  домена с `crawl_delay`; последовательные старты не ближе `crawl_delay` друг к
+  другу ни в одной паре (не только по порядку, но и по времени).
+- `test_backoff_doubles_on_429_and_5xx` — вызвать `record_response(domain,
+  429)` несколько раз подряд; надбавка растёт (`1.0 -> 2.0 -> 4.0 ...`), не
+  превышает `60.0`.
+- `test_backoff_doubles_on_network_error` — `record_response(domain, None)` —
+  тот же рост, что и на `429`/`5xx`.
+- `test_backoff_decays_on_success` — после нескольких `record_response(domain,
+  429)` вызвать `record_response(domain, 200)` несколько раз — надбавка падает
+  к `0.0`, не уходит в отрицательные значения.
+- `test_backoff_affects_next_dispatch_via_slot` — интеграционный: взвинтить
+  backoff через `record_response`, затем измерить, что `slot(domain)` (без
+  `crawl_delay`) всё равно ждёт из-за backoff.
+
+`tests/test_robots.py`:
+- `test_crawl_delay_parsed` — `robots.txt` с `Crawl-delay: 10` → `await
+  cache.crawl_delay(url, ua) == 10.0`.
+- `test_crawl_delay_absent_is_none` — без директивы → `None`.
+
+`tests/test_cli.py`:
+- `test_crawl_delay_from_robots_applied` (`@respx.mock`) — `robots.txt` с
+  небольшим `Crawl-delay` (`0.02`–`0.05`, чтобы тест не был медленным), граф из
+  2+ страниц одного домена; измерить, что общее время обхода (`elapsed` из
+  `_run`) не меньше ожидаемого нижнего порога с учётом интервала между
+  запросами (допуск на дрожание расписания event loop).
+- `test_5xx_response_triggers_backoff_call` — можно проверить косвенно (через
+  `limiter._backoff` в интеграционном тесте) либо через spy/monkeypatch на
+  `record_response`, что он реально вызывается с ожидаемым `status`.
+
+### Границы / что НЕ входит в этот этап
+
+- Директива `Sitemap:` из robots.txt (обнаружение и, тем более, автоматическое
+  добавление во фронтир) — отдельная фича с другим скоупом (seed discovery, а
+  не rate-limiting), намеренно вынесена за рамки Этапа 6. Остаётся в
+  `POST_MVP_PLAN.md`.
+- Конфигурируемость констант backoff через CLI-флаги — не требуется, фиксированные
+  значения в коде.
+- Persist backoff/next_dispatch между запусками процесса — не требуется
+  (краулер однопроцессный, состояние живёт в памяти одного прогона, как и
+  весь остальной rate-limiting).
+
+**Готово когда:** сайт с `Crawl-delay:` в robots.txt обходится с реальным
+интервалом между запросами к нему; серия 429/5xx от домена увеличивает
+интервал между последующими запросами к этому домену, не влияя на другие
+домены.
+
+---
+
 ## Сквозные принципы
 
 - **Ошибки не роняют обход** — сетевые/парсинг-ошибки логируются и учитываются в отчёте.

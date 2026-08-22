@@ -139,9 +139,16 @@ class Crawler:
             self.stats.record_skipped_robots(host)
             return
 
-        # 3-4. per-domain slot held only around the fetch itself.
-        async with self._limiter.slot(host):
+        # 3-4. per-domain slot held only around the fetch itself. Crawl-delay
+        # comes from the already-warmed RobotsCache (same robots.txt loaded on
+        # step 2 for allowed() — no extra network round-trip).
+        delay = await self._robots.crawl_delay(url, self._user_agent)
+        async with self._limiter.slot(host, crawl_delay=delay or 0.0):
             result = await fetch(self._client, url)
+        # 4b. adjust adaptive backoff AFTER the slot is released (backoff must
+        # not keep the semaphore busy longer than the fetch itself). A
+        # transport error surfaces as status=None and raises the backoff.
+        self._limiter.record_response(host, result.status)
 
         # 5. transport error -> errors; otherwise visited.
         if result.error is not None:

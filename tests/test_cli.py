@@ -9,6 +9,7 @@ import pytest
 import respx
 
 from politecrawl.cli import CrawlStats, _build_parser, _format_report, _run, main
+from politecrawl.ratelimit import PerDomainLimiter
 
 UA = "politecrawl/0.0"
 HOST = "site.test"
@@ -243,6 +244,61 @@ async def test_empty_links_page() -> None:
     assert stats.visited == 1
     assert stats.skipped_dedup == 0
     assert stats.errors == 0
+
+
+# --- Этап 6: crawl-delay из robots.txt + backoff ----------------------------
+
+
+@respx.mock
+async def test_crawl_delay_from_robots_applied() -> None:
+    # stdlib RobotFileParser парсит только ЦЕЛЫЕ Crawl-delay (дробные -> None),
+    # поэтому минимальный выразимый через robots.txt интервал — 1 секунда
+    # (в плане предлагалось 0.02-0.05, но stdlib это отбрасывает). Граф из
+    # двух страниц: тест платит ровно за один интервал, ~1s.
+    respx.get(f"{BASE}/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nCrawl-delay: 1\n")
+    )
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a")
+    stats, elapsed = await asyncio.wait_for(
+        _run(
+            [f"{BASE}/"],
+            max_depth=1,
+            per_domain_concurrency=2,
+            total_workers=4,
+            user_agent=UA,
+        ),
+        timeout=5.0,
+    )
+    assert stats.visited == 2
+    assert stats.errors == 0
+    # первый запрос стартует сразу, второй выжидает crawl-delay целиком
+    # (допуск на дрожание планировщика event loop)
+    assert elapsed >= 0.9
+
+
+@respx.mock
+async def test_5xx_response_triggers_backoff_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/boom'>b</a>")
+    respx.get(f"{BASE}/boom").mock(return_value=httpx.Response(503))
+
+    calls: list[tuple[str, int | None]] = []
+    original = PerDomainLimiter.record_response
+
+    def spy(self: PerDomainLimiter, domain: str, status: int | None) -> None:
+        calls.append((domain, status))
+        original(self, domain, status)
+
+    monkeypatch.setattr(PerDomainLimiter, "record_response", spy)
+    stats = await _run_default(max_depth=1)
+
+    # record_response вызван на каждый fetch с фактическим статусом
+    assert (HOST, 200) in calls
+    assert (HOST, 503) in calls
+    # 5xx — не транспортная ошибка: страница скачана и посчитана как visited
+    assert stats.errors == 0
+    assert stats.visited == 2
 
 
 # --- report formatting ------------------------------------------------------

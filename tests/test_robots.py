@@ -89,6 +89,31 @@ async def test_robots_downloaded_exactly_once_under_concurrency() -> None:
     assert all(isinstance(r, bool) for r in results)
 
 
+# --- crawl-delay (Этап 6) ---------------------------------------------------
+
+
+@respx.mock
+async def test_crawl_delay_parsed() -> None:
+    respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(
+            200, text="User-agent: *\nCrawl-delay: 10\nDisallow: /private\n"
+        )
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        cache = RobotsCache(client)
+        assert await cache.crawl_delay("https://example.com/page", UA) == 10.0
+
+
+@respx.mock
+async def test_crawl_delay_absent_is_none() -> None:
+    respx.get("https://example.com/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /private\n")
+    )
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        cache = RobotsCache(client)
+        assert await cache.crawl_delay("https://example.com/page", UA) is None
+
+
 @respx.mock
 async def test_http_and_https_cached_separately() -> None:
     respx.get("http://example.com/robots.txt").mock(
