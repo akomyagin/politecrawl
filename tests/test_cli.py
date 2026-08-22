@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import Counter
 from pathlib import Path
 
 import httpx
 import pytest
 import respx
 
+from politecrawl.checkpoint import CrawlSnapshot, load_checkpoint, save_checkpoint
 from politecrawl.cli import Crawler, CrawlStats, _build_parser, _format_report, _run, main
 from politecrawl.ratelimit import PerDomainLimiter
 
@@ -434,9 +436,7 @@ def test_export_bad_extension_before_crawl(tmp_path: Path) -> None:
 
 
 @respx.mock
-def test_no_export_flags_writes_nothing(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_no_export_flags_writes_nothing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     _mock_robots_404()
     _mock_page("/", "<a href='/a'>a</a>")
     _mock_page("/a")
@@ -548,9 +548,7 @@ async def test_sitemap_index_two_levels_not_expanded() -> None:
         "/child-index.xml",
         _sitemapindex(f"{BASE}/grandchild.xml"),
     )
-    grandchild_sitemap_route = _mock_sitemap(
-        "/grandchild.xml", _urlset(f"{BASE}/from-grandchild")
-    )
+    grandchild_sitemap_route = _mock_sitemap("/grandchild.xml", _urlset(f"{BASE}/from-grandchild"))
     _mock_page("/", "<html></html>")
     from_grandchild = _mock_page("/from-grandchild")
     stats = await _run_default(max_depth=1)
@@ -612,3 +610,402 @@ def test_format_report_lists_hosts_sorted() -> None:
     assert "errors:         1" in report
     assert "elapsed:        0.500s" in report
     assert report.index("a.test") < report.index("b.test")
+
+
+# --- Этап 9: персистентность фронтира (чекпоинт + resume) -------------------
+
+
+def _totals(**over: int) -> dict[str, int]:
+    totals = {
+        "visited": 0,
+        "skipped_dedup": 0,
+        "skipped_robots": 0,
+        "errors": 0,
+        "sitemap_urls": 0,
+    }
+    totals.update(over)
+    return totals
+
+
+def _artificial_snapshot(
+    *,
+    frontier: list[tuple[str, int]],
+    seen: set[str],
+    seeds: list[str] | None = None,
+    max_depth: int = 2,
+    per_host: dict[str, Counter[str]] | None = None,
+    sitemap_hosts: set[str] | None = None,
+    fetched_sitemaps: set[str] | None = None,
+    **totals_over: int,
+) -> CrawlSnapshot:
+    """Искусственный снимок частично обойдённого графа (план §Тесты)."""
+    return CrawlSnapshot(
+        seeds=seeds if seeds is not None else [f"{BASE}/"],
+        max_depth=max_depth,
+        user_agent=UA,
+        frontier=frontier,
+        seen=seen,
+        stats_totals=_totals(**totals_over),
+        per_host=per_host if per_host is not None else {},
+        edges=[],
+        pages=[],
+        sitemap_hosts=sitemap_hosts if sitemap_hosts is not None else set(),
+        fetched_sitemaps=fetched_sitemaps if fetched_sitemaps is not None else set(),
+    )
+
+
+async def _run_with_checkpoint(
+    checkpoint_path: str,
+    *,
+    max_depth: int = 1,
+    snapshot: CrawlSnapshot | None = None,
+) -> Crawler:
+    crawler, _elapsed = await asyncio.wait_for(
+        _run(
+            [f"{BASE}/"],
+            max_depth=max_depth,
+            per_domain_concurrency=2,
+            total_workers=2,
+            user_agent=UA,
+            checkpoint_path=checkpoint_path,
+            snapshot=snapshot,
+        ),
+        timeout=5.0,
+    )
+    return crawler
+
+
+async def _interrupt_crawl(checkpoint_path: str, started: asyncio.Event, max_depth: int) -> None:
+    """Запустить обход и детерминированно отменить его, когда started взведён.
+
+    Модель Ctrl-C/SIGTERM: отмена доходит до Crawler.run() как CancelledError,
+    финальный чекпоинт пишется в его finally до гашения воркеров.
+    """
+    task = asyncio.ensure_future(
+        _run(
+            [f"{BASE}/"],
+            max_depth=max_depth,
+            per_domain_concurrency=2,
+            total_workers=2,
+            user_agent=UA,
+            checkpoint_path=checkpoint_path,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=5.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+def _hang_then_serve(started: asyncio.Event, html: str = "<html></html>") -> respx.Route:
+    """Мок /a: первый запрос виснет навсегда (взведя started), последующие — 200.
+
+    Даёт детерминированную точку прерывания: пока первый fetch висит, /a
+    гарантированно in-flight; после resume повторный запрос уже отвечает.
+    """
+    calls = 0
+
+    async def side_effect(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await asyncio.Event().wait()  # блокируется до отмены воркера
+        return httpx.Response(200, html=html)
+
+    return respx.get(f"{BASE}/a").mock(side_effect=side_effect)
+
+
+def test_argparse_checkpoint_flags() -> None:
+    args = _build_parser().parse_args(["http://x"])
+    assert args.checkpoint is None
+    assert args.resume is False
+    assert args.checkpoint_every == 100
+    args = _build_parser().parse_args(
+        ["http://x", "--checkpoint", "state.json", "--resume", "--checkpoint-every", "7"]
+    )
+    assert args.checkpoint == "state.json"
+    assert args.resume is True
+    assert args.checkpoint_every == 7
+
+
+def test_resume_requires_checkpoint(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = main(["http://x", "--resume"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "--resume" in err
+    assert "--checkpoint" in err
+    assert "Traceback" not in err
+
+
+@respx.mock
+def test_resume_missing_file_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _mock_robots_404()
+    seed_route = _mock_page("/")
+    rc = main([f"{BASE}/", "--checkpoint", str(tmp_path / "missing.json"), "--resume"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "does not exist" in err
+    assert seed_route.call_count == 0  # обход не запускается
+
+
+@respx.mock
+def test_resume_corrupt_file_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cp = tmp_path / "state.json"
+    cp.write_text("{broken json", encoding="utf-8")
+    _mock_robots_404()
+    seed_route = _mock_page("/")
+    rc = main([f"{BASE}/", "--checkpoint", str(cp), "--resume"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "JSON" in err
+    assert cp.read_text(encoding="utf-8") == "{broken json"  # файл не перезаписан
+    assert seed_route.call_count == 0
+
+
+@respx.mock
+def test_checkpoint_written_periodically(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a><a href='/b'>b</a>")
+    _mock_page("/a")
+    _mock_page("/b")
+    cp = tmp_path / "state.json"
+    save_paths: list[str] = []
+
+    def spy(snapshot: CrawlSnapshot, path: str) -> None:
+        save_paths.append(path)
+        save_checkpoint(snapshot, path)
+
+    monkeypatch.setattr("politecrawl.cli.save_checkpoint", spy)
+    rc = main([f"{BASE}/", "--max-depth", "1", "--checkpoint", str(cp), "--checkpoint-every", "1"])
+    assert rc == 0
+    # --checkpoint-every 1 на графе из 3 страниц: были и периодические записи,
+    # а не только финальная из run()'s finally.
+    assert len(save_paths) >= 2
+    assert set(save_paths) == {str(cp)}
+    final = load_checkpoint(str(cp))  # файл существует и валиден
+    assert final.frontier == []  # финальный снимок: фронтир дренирован
+    assert final.stats_totals["visited"] == 3
+    assert final.seeds == [f"{BASE}/"]
+
+
+@respx.mock
+async def test_checkpoint_written_on_interrupt(tmp_path: Path) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a><a href='/b'>b</a>")
+    _mock_page("/b")
+    started = asyncio.Event()
+    _hang_then_serve(started)
+    cp = tmp_path / "state.json"
+    await _interrupt_crawl(str(cp), started, max_depth=1)
+
+    snap = load_checkpoint(str(cp))
+    # in-flight /a (вынут из очереди, fetch завис) обязан попасть во фронтир
+    assert (f"{BASE}/a", 1) in snap.frontier
+    # и исключён из seen: _process уже отметил его в дедупе, но не завершил;
+    # останься он в seen — resume срезал бы его на заборе дедупа навсегда
+    assert f"{BASE}/a" not in snap.seen
+    assert f"{BASE}/" in snap.seen  # сам seed обработан и остаётся виденным
+
+
+@respx.mock
+def test_resume_continues_from_frontier(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _mock_robots_404()
+    root_route = _mock_page("/", "<a href='/a'>a</a>")
+    a_route = _mock_page("/a")
+    cp = tmp_path / "state.json"
+    snapshot = _artificial_snapshot(
+        frontier=[(f"{BASE}/a", 1)],
+        seen={f"{BASE}/"},
+        per_host={HOST: Counter({"visited": 1})},
+        visited=1,
+    )
+    save_checkpoint(snapshot, str(cp))
+    rc = main([f"{BASE}/", "--checkpoint", str(cp), "--resume"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert root_route.call_count == 0  # уже виденное не перекачивается
+    assert a_route.call_count == 1  # хвост фронтира добран
+    # seeds на resume НЕ enqueue-ятся заново: иначе seed прошёл бы через дедуп
+    # и в отчёте появился бы skipped_dedup >= 1
+    assert "skipped_dedup:  0" in out
+    assert "visited:        2" in out  # 1 из снимка + добранный /a
+
+
+@respx.mock
+async def test_resume_final_state_matches_uninterrupted(tmp_path: Path) -> None:
+    """Ключевой: прерванный+resume обход == непрерывный по stats/edges/pages."""
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/b")
+    started = asyncio.Event()
+    # 1-й запрос /a (прерванный прогон) виснет; 2-й (resume) и 3-й
+    # (непрерывный прогон) отдают страницу со ссылкой дальше.
+    _hang_then_serve(started, html="<a href='/b'>b</a>")
+    cp = tmp_path / "state.json"
+
+    # (б) прерваться, пока /a in-flight, затем возобновиться из чекпоинта
+    await _interrupt_crawl(str(cp), started, max_depth=2)
+    resumed = await _run_with_checkpoint(str(cp), max_depth=2, snapshot=load_checkpoint(str(cp)))
+
+    # (а) непрерывный прогон того же графа
+    uninterrupted, _elapsed = await asyncio.wait_for(
+        _run(
+            [f"{BASE}/"],
+            max_depth=2,
+            per_domain_concurrency=2,
+            total_workers=2,
+            user_agent=UA,
+        ),
+        timeout=5.0,
+    )
+
+    assert resumed.stats.totals() == uninterrupted.stats.totals()
+    assert resumed.stats.per_host == uninterrupted.stats.per_host
+    assert set(resumed.edges) == set(uninterrupted.edges)
+    key = "url"
+    assert sorted(resumed.pages, key=lambda p: str(p[key])) == sorted(
+        uninterrupted.pages, key=lambda p: str(p[key])
+    )
+    assert uninterrupted.stats.visited == 3  # /, /a, /b — прогресс не потерян и не удвоен
+
+
+@respx.mock
+def test_resume_seed_mismatch_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cp = tmp_path / "state.json"
+    save_checkpoint(_artificial_snapshot(frontier=[], seen=set()), str(cp))
+    respx.get("https://other.test/robots.txt").mock(return_value=httpx.Response(404))
+    other_route = respx.get("https://other.test/").mock(return_value=httpx.Response(200))
+    rc = main(["https://other.test/", "--checkpoint", str(cp), "--resume"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "seeds" in err
+    assert other_route.call_count == 0  # обход не идёт
+
+
+@respx.mock
+def test_resume_max_depth_mismatch_errors(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cp = tmp_path / "state.json"
+    save_checkpoint(_artificial_snapshot(frontier=[], seen=set(), max_depth=2), str(cp))
+    _mock_robots_404()
+    seed_route = _mock_page("/")
+    rc = main([f"{BASE}/", "--max-depth", "3", "--checkpoint", str(cp), "--resume"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "max-depth" in err
+    assert seed_route.call_count == 0
+
+
+@respx.mock
+def test_resume_preserves_sitemap_state(tmp_path: Path) -> None:
+    # Хост site.test в первом прогоне полностью обойдён, его sitemap-обнаружение
+    # зафиксировано в снимке; во фронтире остался только другой хост. На resume
+    # ни robots.txt, ни sitemap хоста site.test не запрашиваются повторно.
+    robots_route = _mock_robots_with_sitemap()
+    sitemap_route = _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/from-sitemap"))
+    respx.get("https://other.test/robots.txt").mock(return_value=httpx.Response(404))
+    tail_route = respx.get("https://other.test/tail").mock(
+        return_value=httpx.Response(200, html="<html></html>")
+    )
+    cp = tmp_path / "state.json"
+    snapshot = _artificial_snapshot(
+        frontier=[("https://other.test/tail", 1)],
+        seen={f"{BASE}/", f"{BASE}/from-sitemap"},
+        sitemap_hosts={HOST},
+        fetched_sitemaps={f"{BASE}/sitemap.xml"},
+        visited=2,
+        sitemap_urls=1,
+    )
+    save_checkpoint(snapshot, str(cp))
+    rc = main([f"{BASE}/", "--checkpoint", str(cp), "--resume"])
+    assert rc == 0
+    assert robots_route.call_count == 0  # robots хоста не перекачивается
+    assert sitemap_route.call_count == 0  # обнаружение не переигрывается
+    assert tail_route.call_count == 1  # хвост фронтира добран
+    final = load_checkpoint(str(cp))
+    assert final.stats_totals["sitemap_urls"] == 1  # не удвоился
+
+
+@respx.mock
+def test_resume_skips_sitemap_discovery_for_seen_host(tmp_path: Path) -> None:
+    # Во фронтире остался depth-0 URL хоста, чьё обнаружение уже состоялось:
+    # robots.txt перечитывается ради allowed() (RobotsCache намеренно не
+    # персистится), но sitemap повторно НЕ скачивается и sitemap_urls не растёт.
+    robots_route = _mock_robots_with_sitemap()
+    sitemap_route = _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/from-sitemap"))
+    from_sitemap_route = _mock_page("/from-sitemap")
+    cp = tmp_path / "state.json"
+    snapshot = _artificial_snapshot(
+        frontier=[(f"{BASE}/from-sitemap", 0)],
+        seen={f"{BASE}/"},
+        sitemap_hosts={HOST},
+        fetched_sitemaps={f"{BASE}/sitemap.xml"},
+        visited=1,
+        sitemap_urls=1,
+    )
+    save_checkpoint(snapshot, str(cp))
+    rc = main([f"{BASE}/", "--checkpoint", str(cp), "--resume"])
+    assert rc == 0
+    assert sitemap_route.call_count == 0  # discovery не переигрывается
+    assert from_sitemap_route.call_count == 1
+    assert robots_route.call_count == 1  # только для allowed(), не для discovery
+    final = load_checkpoint(str(cp))
+    assert final.stats_totals["sitemap_urls"] == 1
+
+
+@respx.mock
+def test_no_checkpoint_flag_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a")
+    save_calls: list[str] = []
+    monkeypatch.setattr(
+        "politecrawl.cli.save_checkpoint",
+        lambda snapshot, path: save_calls.append(str(path)),
+    )
+    rc = main([f"{BASE}/", "--max-depth", "1"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert save_calls == []  # save_checkpoint не вызывался вовсе
+    assert list(tmp_path.iterdir()) == []  # и файлов не появилось
+    assert "visited:        2" in out  # поведение обхода как на Этапе 8
+
+
+@respx.mock
+def test_resume_exports_include_first_run(tmp_path: Path) -> None:
+    _mock_robots_404()
+    _mock_page("/", "<html><head><title>Root</title></head><a href='/a'>a</a></html>")
+    started = asyncio.Event()
+    _hang_then_serve(started, html="<html><head><title>Page A</title></head></html>")
+    cp = tmp_path / "state.json"
+
+    # Прерваться, пока /a in-flight: в чекпоинте pages/edges только 1-го прогона.
+    asyncio.run(_interrupt_crawl(str(cp), started, 1))
+
+    edges_path = tmp_path / "edges.jsonl"
+    pages_path = tmp_path / "pages.jsonl"
+    rc = main(
+        [
+            f"{BASE}/",
+            "--max-depth",
+            "1",
+            "--checkpoint",
+            str(cp),
+            "--resume",
+            "--export-edges",
+            str(edges_path),
+            "--export-pages",
+            str(pages_path),
+        ]
+    )
+    assert rc == 0
+    pages = [json.loads(line) for line in pages_path.read_text(encoding="utf-8").splitlines()]
+    assert {p["url"] for p in pages} == {f"{BASE}/", f"{BASE}/a"}  # оба прогона
+    assert {p["title"] for p in pages} == {"Root", "Page A"}
+    edges = [json.loads(line) for line in edges_path.read_text(encoding="utf-8").splitlines()]
+    # ребро найдено ПЕРВЫМ прогоном и пережило чекпоинт
+    assert {"source": f"{BASE}/", "target": f"{BASE}/a"} in edges
