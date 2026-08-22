@@ -117,3 +117,33 @@ def test_seen_does_not_mutate_state() -> None:
     assert dedup.seen(url) is False
     assert dedup.seen(url) is False  # calling seen() again must not have added it
     assert dedup.add(url) is True  # still unseen: seen() above did not insert
+
+
+# --- Этап 9: снимок/загрузка _seen для чекпоинта -----------------------------
+
+
+def test_dedup_snapshot_roundtrip() -> None:
+    first = UrlDedup()
+    first.add("HTTP://Example.com:80/x?b=2&a=1#frag")  # нормализуется при add()
+    first.add("http://example.com/y")
+    snapshot = first.snapshot_seen()
+
+    second = UrlDedup()
+    second.load_seen(snapshot)
+    # ранее виденные (в т.ч. в эквивалентной записи) -> True, новый -> False
+    assert second.seen("http://example.com/x?a=1&b=2") is True
+    assert second.seen("http://example.com/y") is True
+    assert second.seen("http://example.com/z") is False
+    # снимок — копия: дальнейшие add() первого экземпляра его не меняют
+    first.add("http://example.com/later")
+    assert "http://example.com/later" not in snapshot
+
+
+def test_dedup_load_seen_does_not_renormalize() -> None:
+    dedup = UrlDedup()
+    # Намеренно НЕнормализованная запись: load_seen() обязан положить её как
+    # есть (снимки пишет сам add() уже нормализованными, повторная
+    # нормализация не выполняется) — поэтому нормализованный эквивалент
+    # НЕ считается виденным.
+    dedup.load_seen({"HTTP://Example.com/x"})
+    assert dedup.seen("http://example.com/x") is False

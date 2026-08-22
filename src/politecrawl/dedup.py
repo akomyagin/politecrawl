@@ -12,6 +12,7 @@ Bloom filter отложен в POST_MVP — на single-machine скоупе с 
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -72,3 +73,23 @@ class UrlDedup:
     def seen(self, url: str) -> bool:
         """Return whether an equivalent URL has already been added."""
         return normalize(url) in self._seen
+
+    def snapshot_seen(self) -> set[str]:
+        """Return a copy of the seen-set for checkpointing (Stage 9).
+
+        Entries are already normalized (add() stores normalized keys only).
+        A copy, so the caller's snapshot stays stable while the crawl keeps
+        mutating this dedup instance.
+        """
+        return set(self._seen)
+
+    def load_seen(self, seen: Iterable[str]) -> None:
+        """Replace the seen-set with a checkpoint snapshot (Stage 9).
+
+        Snapshot entries were produced by add(), i.e. they are ALREADY
+        normalized. They are loaded as-is, deliberately WITHOUT re-running
+        normalize(): re-normalizing an already-normalized URL is redundant
+        work, and doing it here would hide format drift instead of exposing
+        it in tests.
+        """
+        self._seen = set(seen)
