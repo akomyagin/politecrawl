@@ -16,7 +16,16 @@ from urllib.parse import urlsplit
 import httpx
 
 from politecrawl.dedup import UrlDedup
-from politecrawl.fetcher import extract_links, fetch
+from politecrawl.export import (
+    Edge,
+    ExportFormatError,
+    PageMeta,
+    validate_extension,
+    write_edges,
+    write_pages,
+    write_sitemap,
+)
+from politecrawl.fetcher import extract_links, extract_title, fetch
 from politecrawl.ratelimit import PerDomainLimiter
 from politecrawl.robots import RobotsCache
 
@@ -82,6 +91,12 @@ class Crawler:
         self._user_agent = user_agent
         self._queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
         self.stats = CrawlStats()
+        # Export accumulators (Stage 7). Mutated only from crawl workers in ONE
+        # event loop with no await between read and write (list.append), so the
+        # mutation is atomic within an event-loop step — no lock is needed
+        # (same precedent as CrawlStats/UrlDedup, Stages 4-5).
+        self.edges: list[Edge] = []
+        self.pages: list[PageMeta] = []
 
     async def run(self, seeds: list[str], total_workers: int) -> None:
         """Crawl from seeds with a pool of workers until the frontier drains."""
@@ -150,17 +165,31 @@ class Crawler:
         # transport error surfaces as status=None and raises the backoff.
         self._limiter.record_response(host, result.status)
 
-        # 5. transport error -> errors; otherwise visited.
+        # 5. transport error -> errors; otherwise visited + record page metadata.
         if result.error is not None:
             self.stats.record_error(host)
             return
         self.stats.record_visited(host)
+        self.pages.append(
+            {
+                "url": url,
+                "status": result.status,
+                "content_type": result.content_type,
+                "title": extract_title(result.body),
+            }
+        )
 
-        # 6. extract links and enqueue them if depth allows. Duplicates are
-        # enqueued unfiltered: step 1 of the worker that picks them up is the
-        # single atomic dedup point.
+        # 6. extract links: record EVERY outgoing edge (this is the link graph,
+        # not the crawl graph — edges are kept even when the target is beyond
+        # max_depth or will later be dropped by dedup/robots), then enqueue
+        # targets only if depth allows. Duplicates are enqueued unfiltered:
+        # step 1 of the worker that picks them up is the single atomic dedup
+        # point.
+        links = extract_links(url, result.body)
+        for link in links:
+            self.edges.append((url, link))
         if depth + 1 <= self._max_depth:
-            for link in extract_links(url, result.body):
+            for link in links:
                 self._queue.put_nowait((link, depth + 1))
 
 
@@ -194,6 +223,27 @@ def _build_parser() -> argparse.ArgumentParser:
         default="politecrawl/0.0",
         help="User-Agent for requests and robots.can_fetch",
     )
+    parser.add_argument(
+        "--export-edges",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="write the link graph (source->target edges) to PATH (.jsonl or .csv)",
+    )
+    parser.add_argument(
+        "--export-sitemap",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="write a sitemap-like XML of visited URLs to PATH",
+    )
+    parser.add_argument(
+        "--export-pages",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="write page metadata (url, status, content_type, title) to PATH (.jsonl or .csv)",
+    )
     return parser
 
 
@@ -204,7 +254,7 @@ async def _run(
     per_domain_concurrency: int,
     total_workers: int,
     user_agent: str,
-) -> tuple[CrawlStats, float]:
+) -> tuple[Crawler, float]:
     """Build the client and dependencies inside the event loop and crawl."""
     start = time.perf_counter()
     async with httpx.AsyncClient(
@@ -221,7 +271,7 @@ async def _run(
         )
         await crawler.run(seeds, total_workers)
     elapsed = time.perf_counter() - start
-    return crawler.stats, elapsed
+    return crawler, elapsed
 
 
 def _format_report(stats: CrawlStats, elapsed: float) -> str:
@@ -245,10 +295,37 @@ def _format_report(stats: CrawlStats, elapsed: float) -> str:
     return "\n".join(lines)
 
 
+def _validate_export_paths(args: argparse.Namespace) -> None:
+    """Validate tabular export extensions up front, before the crawl runs.
+
+    Raises ExportFormatError so a typo in --export-edges/--export-pages fails
+    fast instead of after a full (wasted) crawl. Sitemap paths are not checked:
+    write_sitemap ignores the extension.
+    """
+    for path in (args.export_edges, args.export_pages):
+        if path is not None:
+            validate_extension(path)
+
+
+def _run_exports(crawler: Crawler, args: argparse.Namespace) -> None:
+    """Write requested exports. Raises ExportFormatError on a bad extension."""
+    if args.export_edges is not None:
+        write_edges(crawler.edges, args.export_edges)
+    if args.export_pages is not None:
+        write_pages(crawler.pages, args.export_pages)
+    if args.export_sitemap is not None:
+        write_sitemap([str(p["url"]) for p in crawler.pages], args.export_sitemap)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Точка входа CLI: разобрать аргументы, обойти граф, напечатать отчёт."""
+    """Точка входа CLI: разобрать аргументы, обойти граф, отчёт + экспорт."""
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
-    stats, elapsed = asyncio.run(
+    try:
+        _validate_export_paths(args)
+    except ExportFormatError as exc:
+        print(f"politecrawl: {exc}", file=sys.stderr)
+        return 2
+    crawler, elapsed = asyncio.run(
         _run(
             args.seeds,
             max_depth=args.max_depth,
@@ -257,7 +334,12 @@ def main(argv: list[str] | None = None) -> int:
             user_agent=args.user_agent,
         )
     )
-    print(_format_report(stats, elapsed))
+    print(_format_report(crawler.stats, elapsed))
+    try:
+        _run_exports(crawler, args)
+    except ExportFormatError as exc:  # pragma: no cover - guarded by validation
+        print(f"politecrawl: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
