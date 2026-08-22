@@ -238,7 +238,14 @@ def test_report_contains_counters(capsys: pytest.CaptureFixture[str]) -> None:
     rc = main([f"{BASE}/", "--max-depth", "1"])
     out = capsys.readouterr().out
     assert rc == 0
-    for token in ("visited", "skipped_dedup", "skipped_robots", "errors", "elapsed"):
+    for token in (
+        "visited",
+        "skipped_dedup",
+        "skipped_robots",
+        "errors",
+        "sitemap_urls",
+        "elapsed",
+    ):
         assert token in out
     assert HOST in out
 
@@ -438,6 +445,158 @@ def test_no_export_flags_writes_nothing(
     assert rc == 0
     assert list(tmp_path.iterdir()) == []  # no export files created
     assert "visited:        2" in out  # crawl behaviour unchanged
+
+
+# --- Этап 8: Sitemap: из robots.txt -----------------------------------------
+
+SITEMAP_XMLNS = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+
+
+def _mock_robots_with_sitemap(sitemap_path: str = "/sitemap.xml", rules: str = "") -> respx.Route:
+    return respx.get(f"{BASE}/robots.txt").mock(
+        return_value=httpx.Response(
+            200,
+            text=f"User-agent: *\n{rules}Sitemap: {BASE}{sitemap_path}\n",
+        )
+    )
+
+
+def _urlset(*urls: str) -> str:
+    locs = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+    return f"<urlset {SITEMAP_XMLNS}>{locs}</urlset>"
+
+
+def _sitemapindex(*urls: str) -> str:
+    locs = "".join(f"<sitemap><loc>{u}</loc></sitemap>" for u in urls)
+    return f"<sitemapindex {SITEMAP_XMLNS}>{locs}</sitemapindex>"
+
+
+def _mock_sitemap(path: str, xml: str) -> respx.Route:
+    return respx.get(f"{BASE}{path}").mock(
+        return_value=httpx.Response(200, text=xml, headers={"content-type": "application/xml"})
+    )
+
+
+@respx.mock
+async def test_sitemap_urls_discovered_and_enqueued() -> None:
+    # /orphan1 and /orphan2 are declared only in the sitemap: no <a href>
+    # anywhere points at them.
+    _mock_robots_with_sitemap()
+    _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/orphan1", f"{BASE}/orphan2"))
+    _mock_page("/", "<html></html>")
+    orphan1 = _mock_page("/orphan1")
+    orphan2 = _mock_page("/orphan2")
+    stats = await _run_default(max_depth=1)
+    assert stats.visited == 3  # seed + both sitemap-only pages
+    assert stats.sitemap_urls == 2
+    assert orphan1.call_count == 1
+    assert orphan2.call_count == 1
+
+
+@respx.mock
+async def test_sitemap_fetched_once_per_host() -> None:
+    robots_route = _mock_robots_with_sitemap()
+    sitemap_route = _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/p"))
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a")
+    _mock_page("/p")
+    crawler, _elapsed = await asyncio.wait_for(
+        _run(
+            [f"{BASE}/", f"{BASE}/a"],  # two depth-0 seeds on the SAME host
+            max_depth=1,
+            per_domain_concurrency=2,
+            total_workers=4,
+            user_agent=UA,
+        ),
+        timeout=5.0,
+    )
+    assert crawler.stats.visited == 3  # /, /a, /p
+    assert robots_route.call_count == 1  # RobotsCache: one download per host
+    assert sitemap_route.call_count == 1  # discovery ran once per host
+
+
+@respx.mock
+async def test_sitemap_index_one_level() -> None:
+    _mock_robots_with_sitemap("/sitemap-index.xml")
+    _mock_sitemap(
+        "/sitemap-index.xml",
+        _sitemapindex(f"{BASE}/sm-a.xml", f"{BASE}/sm-b.xml"),
+    )
+    _mock_sitemap("/sm-a.xml", _urlset(f"{BASE}/from-a"))
+    _mock_sitemap("/sm-b.xml", _urlset(f"{BASE}/from-b"))
+    _mock_page("/", "<html></html>")
+    from_a = _mock_page("/from-a")
+    from_b = _mock_page("/from-b")
+    stats = await _run_default(max_depth=1)
+    assert from_a.call_count == 1  # pages from child sitemaps are crawled
+    assert from_b.call_count == 1
+    assert stats.visited == 3
+    assert stats.sitemap_urls == 2
+
+
+@respx.mock
+async def test_sitemap_index_two_levels_not_expanded() -> None:
+    # index -> child index -> grandchild sitemap: only ONE level of nesting is
+    # followed, so the grandchild sitemap is never fetched and its page is
+    # never enqueued.
+    _mock_robots_with_sitemap("/sitemap-index.xml")
+    _mock_sitemap(
+        "/sitemap-index.xml",
+        _sitemapindex(f"{BASE}/child-index.xml"),
+    )
+    grandchild_route = _mock_sitemap(
+        "/child-index.xml",
+        _sitemapindex(f"{BASE}/grandchild.xml"),
+    )
+    grandchild_sitemap_route = _mock_sitemap(
+        "/grandchild.xml", _urlset(f"{BASE}/from-grandchild")
+    )
+    _mock_page("/", "<html></html>")
+    from_grandchild = _mock_page("/from-grandchild")
+    stats = await _run_default(max_depth=1)
+    assert grandchild_route.call_count == 1  # the child index itself IS fetched
+    assert grandchild_sitemap_route.call_count == 0  # ...but not expanded further
+    assert from_grandchild.call_count == 0
+    assert stats.visited == 1  # only the seed
+    assert stats.sitemap_urls == 0
+
+
+@respx.mock
+async def test_sitemap_urls_go_through_robots() -> None:
+    _mock_robots_with_sitemap(rules="Disallow: /private\n")
+    _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/private/page"))
+    _mock_page("/", "<html></html>")
+    private_route = _mock_page("/private/page")
+    stats = await _run_default(max_depth=1)
+    # Discovered in the sitemap and enqueued...
+    assert stats.sitemap_urls == 1
+    # ...but dropped at the fence by the NORMAL robots check, never fetched.
+    assert stats.skipped_robots == 1
+    assert private_route.call_count == 0
+    assert stats.visited == 1  # only the seed
+
+
+@respx.mock
+async def test_sitemap_absent_no_effect() -> None:
+    _mock_robots_404()
+    _mock_page("/", "<a href='/a'>a</a>")
+    _mock_page("/a")
+    sitemap_route = _mock_sitemap("/sitemap.xml", _urlset(f"{BASE}/never"))
+    stats = await _run_default(max_depth=1)
+    assert stats.visited == 2  # crawl unchanged: / and /a
+    assert stats.sitemap_urls == 0
+    assert sitemap_route.call_count == 0  # no sitemap request at all
+
+
+@respx.mock
+async def test_malformed_sitemap_does_not_crash() -> None:
+    _mock_robots_with_sitemap()
+    _mock_sitemap("/sitemap.xml", "this is not xml <<<")
+    _mock_page("/", "<html></html>")
+    stats = await asyncio.wait_for(_run_default(max_depth=1), timeout=5.0)
+    assert stats.visited == 1  # the seed is still crawled
+    assert stats.sitemap_urls == 0
+    assert stats.errors == 0  # a bad sitemap is not a crawl error
 
 
 # --- report formatting ------------------------------------------------------

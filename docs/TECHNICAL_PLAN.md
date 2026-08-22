@@ -606,6 +606,237 @@ def write_sitemap(urls: list[str], path: str) -> None: ...   # always XML
 
 ---
 
+## Этап 8 — Sitemap: из robots.txt (POST_MVP)
+
+**Цель:** уважать директиву `Sitemap:` в `robots.txt`. Обнаруживать sitemap-URL,
+объявленные в `robots.txt` домена, скачивать sitemap XML, извлекать из него
+страничные URL и добавлять их в очередь обхода как **дополнительный источник
+ссылок** — сверх того, что находится через `<a href>` на самих страницах. Это
+даёт краулеру страницы, на которые нигде нет внутренних ссылок, но которые сайт
+сам объявил в sitemap.
+
+`Crawl-delay:` из той же группы POST_MVP уже реализован в Этапе 6
+(`RobotsCache.crawl_delay`). Здесь закрывается вторая половина пункта —
+`Sitemap:`.
+
+**Ключевой факт о stdlib:** `urllib.robotparser.RobotFileParser` уже парсит
+директивы `Sitemap:` и отдаёт их через `.site_maps() -> list[str] | None`
+(с Python 3.8; проект на 3.10). `RobotsCache._load_parser` уже вызывает
+`rfp.parse(response.text.splitlines())`, то есть sitemaps **уже распарсены** в
+существующем кеше парсеров — дополнительный сетевой запрос `robots.txt` не нужен,
+как и для `crawl_delay`.
+
+**Модули:** `robots.py` (+`sitemaps()`), `fetcher.py`
+(+`extract_sitemap_urls` — чистый парсер XML рядом с `extract_links`/
+`extract_title`), `cli.py` (обнаружение и загрузка sitemap в `Crawler`,
++счётчик `CrawlStats.sitemap_urls`).
+
+### `robots.py` — `RobotsCache.sitemaps`
+
+Новый async-метод, тем же паттерном, что `crawl_delay`: использует уже
+закешированный парсер (`_get_parser`), никакого дополнительного сетевого
+round-trip для хоста, чей `robots.txt` уже загружен. Контракты `allowed` и
+`crawl_delay` **не меняются** — существующие тесты `tests/test_robots.py` не
+затрагиваются.
+
+```python
+async def sitemaps(self, url: str, user_agent: str) -> list[str]:
+    """Return sitemap URLs declared in the host's robots.txt (may be empty).
+
+    Uses the same cached parser as allowed()/crawl_delay(): no extra network
+    round-trip. site_maps() ignores user_agent (Sitemap: is a global
+    directive, not per-agent); the parameter is kept for call-site symmetry
+    with allowed()/crawl_delay().
+    """
+    rfp = await self._get_parser(_host_key(url))
+    return rfp.site_maps() or []
+```
+
+- `site_maps()` возвращает `list[str] | None` (None = директив нет) → `or []`
+  нормализует в пустой список.
+- `user_agent` не используется парсером (`Sitemap:` — глобальная директива), но
+  оставлен в сигнатуре ради единообразия с `allowed`/`crawl_delay` — все три
+  вызываются из `_process` одинаково.
+
+### `fetcher.py` — `extract_sitemap_urls`
+
+Чистая функция парсинга sitemap XML рядом с `extract_links`/`extract_title` —
+симметрия: все три извлекают структуру из тела ответа. Парсинг через
+`xml.etree.ElementTree` (stdlib), а НЕ `HTMLParser`: sitemap — строгий XML с
+namespace `http://www.sitemaps.org/schemas/sitemap/0.9`, тот же формат, что
+пишет `export.write_sitemap`.
+
+```python
+def extract_sitemap_urls(xml: str) -> tuple[list[str], list[str]]:
+    """Parse a sitemap XML, returning (page_urls, nested_sitemap_urls).
+
+    Handles both sitemaps.org 0.9 document types:
+      - <urlset>:      <url><loc> entries -> page_urls
+      - <sitemapindex>: <sitemap><loc> entries -> nested_sitemap_urls
+    Namespace-agnostic (matches by local tag name, tolerating a missing or
+    unexpected xmlns). Malformed XML yields ([], []) — a bad sitemap must not
+    crash the crawl. Only http/https <loc> values are kept.
+    """
+```
+
+- **Возврат — кортеж двух списков**: страничные URL (`<urlset>/<url>/<loc>`) и
+  вложенные sitemap-URL (`<sitemapindex>/<sitemap>/<loc>`). Так `Crawler` сам
+  решает, что ставить в очередь обхода (страницы), а что — догрузить как
+  дочерний sitemap (см. решение по `<sitemapindex>` ниже).
+- **Namespace-agnostic**: сопоставление по локальному имени тега
+  (`tag.rsplit("}", 1)[-1]`), чтобы не ломаться на sitemap без объявленного
+  xmlns или с нестандартным префиксом. Это устойчивее, чем хардкод namespace.
+- **Битый XML → `([], [])`**: `ET.ParseError` перехватывается; кривой sitemap
+  учитывается как «ничего не нашли», а не роняет обход (сквозной принцип
+  «ошибки не роняют обход»).
+- **Фильтр схем**: только `http`/`https` в `<loc>` (как `extract_links`).
+
+### `cli.py` — обнаружение и загрузка sitemap в `Crawler`
+
+**Когда:** при обработке seed-URL (`depth == 0`) в `_process`, **после** того как
+seed прошёл robots-проверку (шаг 2) — не тратить sitemap-загрузку на хост,
+который сам запрещён. Sitemap-обнаружение выполняется **один раз на хост за
+обход**.
+
+**Дедуп на уровне хоста:** новый атрибут `Crawler._sitemap_hosts: set[str]` —
+множество хостов, для которых обнаружение sitemap уже запущено. Атомарная
+проверка-и-вставка (`host in set` → `set.add`) без `await` между чтением и
+записью, тот же лок-фри прецедент, что `UrlDedup.add`/`edges`/`pages`. Первый
+воркер, дошедший до seed данного хоста, «застолбит» sitemap-обнаружение; воркеры
+других URL того же хоста (депт > 0) его не повторяют.
+
+**Отдельный дедуп самих sitemap-URL:** `Crawler._fetched_sitemaps: set[str]` —
+чтобы не скачивать один и тот же sitemap дважды (важно при `<sitemapindex>`,
+ссылающемся на общие дочерние sitemap, и при пересечении по хостам).
+
+**Как загружается sitemap:** каждый sitemap-URL скачивается тем же `fetch()` и
+под тем же per-domain `limiter.slot()`, что обычные страницы — это тоже сетевой
+запрос к домену, политесс (concurrency-cap + crawl-delay + backoff) обязан
+применяться. Загрузка через вспомогательный метод
+`Crawler._discover_sitemaps(seed_url, host)`:
+
+1. `sitemap_urls = await self._robots.sitemaps(seed_url, self._user_agent)`.
+2. Для каждого sitemap-URL (пропуская уже бывшие в `_fetched_sitemaps`):
+   - `crawl_delay = await self._robots.crawl_delay(sitemap_url, UA)` (тот же
+     warm cache);
+   - `async with self._limiter.slot(sm_host, crawl_delay=delay or 0.0):
+     result = await fetch(self._client, sitemap_url)`;
+   - `self._limiter.record_response(sm_host, result.status)` после слота;
+   - при `result.error is None`: `pages, nested = extract_sitemap_urls(result.body)`;
+   - страничные URL кладутся в очередь как `(page_url, 0)` (депт-0, см. ниже) и
+     считаются в `stats.sitemap_urls`;
+   - вложенные sitemap-URL (`<sitemapindex>`) — **один уровень**: догружаются тем
+     же способом в пределах этого же вызова (не рекурсивно вглубь второго
+     индекса), см. границы.
+
+**С какой глубиной ставить страничные URL из sitemap: `depth = 0`.** Обоснование:
+sitemap — это объявленный сайтом список канонических точек входа, семантически
+это дополнительные seed-подобные URL, а не «ссылки, найденные на странице». Депт-0
+позволяет обойти их собственные исходящие ссылки на полную `max_depth` — иначе
+страницы, известные только из sitemap, дали бы обход на один уровень мельче seed.
+Все они всё равно проходят обычный конвейер `_process` (дедуп → robots → fetch),
+так что депт-0 не создаёт обхода мимо политесса.
+
+**Sitemap-URL идут через обычный конвейер:** извлечённые страничные URL кладутся в
+`self._queue` как любые другие и на заборе проходят `dedup.add` → `robots.allowed`
+→ rate-limited fetch. Для них НЕ создаётся отдельного пути мимо дедупа/robots.
+
+**Интеграция в `_process`:** после успешной robots-проверки seed (депт-0), перед
+или параллельно основному fetch seed, вызвать обнаружение — один раз на хост:
+
+```python
+# 2b. sitemap discovery (Stage 8): once per host, only for depth-0 seeds that
+# passed robots. Enqueues sitemap-declared page URLs as additional depth-0
+# entry points. Guarded so it runs once per host across all workers.
+if depth == 0 and host not in self._sitemap_hosts:
+    self._sitemap_hosts.add(host)
+    await self._discover_sitemaps(url, host)
+```
+
+`_discover_sitemaps` сам не роняет `_process`: обёрнут так, что ошибки
+загрузки/парсинга sitemap учитываются (через `fetch()`/`extract_sitemap_urls`,
+которые не бросают), а не срывают обход seed.
+
+**Счётчик отчёта:** да, новый — `CrawlStats.sitemap_urls` (общий + per-host через
+`_bump`) и `record_sitemap_url(host)`. Считает страничные URL, **обнаруженные**
+в sitemap и поставленные в очередь (не обязательно посещённые — часть отсеётся
+дедупом/robots на заборе; это отражает вклад sitemap как источника, что и есть
+цель наблюдаемости). Печатается в `_format_report` строкой
+`sitemap_urls: N` и в per-host разбивке.
+
+### Тесты
+
+`tests/test_robots.py` (дополнить, `@respx.mock`):
+- `test_sitemaps_parsed` — `robots.txt` с двумя `Sitemap:` строками; `sitemaps()`
+  возвращает оба URL в порядке объявления.
+- `test_sitemaps_absent_is_empty` — `robots.txt` без `Sitemap:`; `sitemaps()`
+  возвращает `[]` (не `None`).
+- `test_sitemaps_uses_cached_parser` — после `allowed()` вызвать `sitemaps()` на
+  том же хосте; `route.call_count == 1` (нет второго запроса robots.txt).
+
+`tests/test_fetcher.py` (дополнить, **без сети/respx** — чистая функция):
+- `test_extract_sitemap_urls_urlset` — `<urlset>` с двумя `<loc>`; вернулись
+  `(["https://x/a", "https://x/b"], [])`.
+- `test_extract_sitemap_urls_index` — `<sitemapindex>` с двумя `<sitemap><loc>`;
+  вернулись `([], [sm1, sm2])`.
+- `test_extract_sitemap_urls_malformed` — не-XML строка → `([], [])`, не бросает.
+- `test_extract_sitemap_urls_no_namespace` — `<urlset>` без `xmlns`; всё равно
+  извлекает `<loc>` (namespace-agnostic).
+- `test_extract_sitemap_urls_filters_non_http` — `<loc>` с `ftp://…` отброшен.
+- `test_extract_sitemap_urls_empty` — пустой `<urlset/>` → `([], [])`.
+
+`tests/test_cli.py` (дополнить, `@respx.mock`; мокать `/robots.txt` и sitemap-URL):
+- `test_sitemap_urls_discovered_and_enqueued` — `robots.txt` объявляет
+  `/sitemap.xml`; sitemap отдаёт две страницы, ни на одну нет `<a href>` с других
+  страниц; после обхода обе посещены (`stats.visited` их включает),
+  `stats.sitemap_urls == 2`.
+- `test_sitemap_fetched_once_per_host` — несколько seed одного хоста (или
+  граф с несколькими страницами хоста); `robots.txt`-route и `sitemap.xml`-route
+  каждый `call_count == 1` (обнаружение один раз на хост).
+- `test_sitemap_index_one_level` — `robots.txt` → sitemap-index → два дочерних
+  sitemap → страницы; страницы из дочерних sitemap обойдены.
+- `test_sitemap_urls_go_through_robots` — sitemap объявляет URL, запрещённый
+  `robots.txt` (Disallow); URL считается в `sitemap_urls` (обнаружен), но при
+  заборе отсеётся robots (`skipped_robots`), не посещён — sitemap-URL идут через
+  обычный конвейер, не мимо него.
+- `test_sitemap_absent_no_effect` — `robots.txt` без `Sitemap:`; обход как
+  раньше, `stats.sitemap_urls == 0`, sitemap-запросов нет.
+- `test_malformed_sitemap_does_not_crash` — sitemap-route отдаёт мусор; обход
+  завершается, seed посещён, `sitemap_urls == 0`.
+
+### Границы / что НЕ входит
+
+- **`<sitemapindex>` — только ОДИН уровень.** Индекс, ссылающийся на дочерние
+  sitemap, обрабатывается: дочерние sitemap догружаются и их страничные URL
+  ставятся в очередь. Но индекс, ссылающийся на другой индекс (второй уровень
+  вложенности), **не** раскрывается рекурсивно — на практике не встречается, а
+  неограниченная рекурсия по индексам — источник циклов и разрастания. Явно
+  вынесено как несделанное: **более одного уровня вложенности sitemap-index —
+  POST_MVP**.
+- **Gzip-сжатые sitemap (`.xml.gz`) не поддерживаются.** `fetch()` отдаёт
+  `response.text`, а `.gz`-тело — бинарь, не текст; распаковка потребовала бы
+  ветки по Content-Type/суффиксу и работы с байтами. Многие сайты отдают и
+  несжатый XML; gzip вынесен в POST_MVP.
+- **`<lastmod>`/`<changefreq>`/`<priority>` игнорируются** — краулеру нужен
+  только `<loc>` (список URL). Это симметрично `write_sitemap`, который тоже
+  пишет только `<loc>`.
+- **robots.txt повторно НЕ качается** — sitemaps берутся из уже загруженного
+  парсера (тот же warm cache, что `allowed`/`crawl_delay`).
+- **Публичные контракты `robots`/`ratelimit`/`dedup`/`fetch`/`FetchResult` не
+  меняются** — добавляются только новые функции/методы. `sitemaps()` —
+  аддитивный метод на `RobotsCache`, `extract_sitemap_urls` — новая функция в
+  `fetcher.py`.
+
+**Готово когда:** обход seed-хоста, чей `robots.txt` объявляет `Sitemap:`,
+скачивает объявленные sitemap под per-domain-политессом, извлекает страничные
+URL (включая один уровень `<sitemapindex>`) и ставит их в очередь как депт-0;
+эти URL проходят обычный дедуп/robots-конвейер; отчёт показывает
+`sitemap_urls: N`; хост, чей `robots.txt` не объявляет sitemap, обходится как
+прежде без лишних запросов; sitemap скачивается один раз на хост; битый или
+gzip-sitemap не роняет обход.
+
+---
+
 ## Сквозные принципы
 
 - **Ошибки не роняют обход** — сетевые/парсинг-ошибки логируются и учитываются в отчёте.
